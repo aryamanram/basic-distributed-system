@@ -1,1 +1,1 @@
-# cs425-mp1
+# Distributed System Querier
