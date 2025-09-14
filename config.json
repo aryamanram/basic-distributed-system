@@ -71,6 +71,6 @@
             "log_file": "machine.10.log"
         }
     ],
-    "timeout": 5,
+    "timeout": 60,
     "parallel": true
 }
