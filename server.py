@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Distributed Grep Server
-Receives grep commands from clients and executes them on local log files
+Enhanced version that automatically serves the correct machine.i.log file
 """
 
 import socket
@@ -12,48 +12,100 @@ import subprocess
 import json
 from threading import Thread
 
-PORT = 3490  # the port users will be connecting to
-BACKLOG = 10  # how many pending connections queue will hold
+PORT = 3490
+BACKLOG = 10
+CONFIG_FILE = 'config.json'
+
+def get_vm_id():
+    """
+    Determine VM ID from hostname or config file.
+    Returns the VM number (1-10) or None if cannot determine.
+    """
+    hostname = socket.gethostname()
+    
+    # Try to extract VM number from hostname (e.g., fa25-cs425-a707 -> 7)
+    if 'a70' in hostname or 'a71' in hostname:
+        # Extract the last digit(s) after 'a70' or 'a71'
+        try:
+            if 'a70' in hostname:
+                vm_num = hostname.split('a70')[1].split('.')[0]
+            else:
+                vm_num = hostname.split('a71')[1].split('.')[0]
+            return int(vm_num)
+        except:
+            pass
+    
+    # Fallback: load config and match by hostname
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            config = json.load(f)
+            for vm in config['vms']:
+                if vm['hostname'] in hostname or hostname in vm['hostname']:
+                    return vm['id']
+    except:
+        pass
+    
+    return None
+
+def get_log_filename():
+    """Get the appropriate log filename for this VM."""
+    vm_id = get_vm_id()
+    if vm_id:
+        return f"machine.{vm_id}.log"
+    else:
+        # Default fallback
+        return "machine.1.log"
 
 def execute_grep(pattern, filename, grep_options=None):
-    """
-    Execute grep command on the specified file with the given pattern.
-    
-    Args:
-        pattern (str): The regex pattern to search for
-        filename (str): The log file to search in
-        grep_options (list): Additional grep options (e.g., ['-i', '-n'])
-    
-    Returns:
-        dict: Contains 'success', 'results', 'line_count', 'filename', and 'error' fields
-    """
+    """Execute grep command on the specified file."""
     try:
-        # Build the grep command
+        # Check if file exists
+        if not os.path.exists(filename):
+            return {
+                'success': False,
+                'results': [],
+                'line_count': 0,
+                'filename': filename,
+                'error': f'File not found: {filename}'
+            }
+        
+        # Build grep command
         cmd = ['grep']
         
-        # Add options if provided
         if grep_options:
             cmd.extend(grep_options)
         
-        # Add the pattern (using -e flag for safety with special characters)
         cmd.extend(['-e', pattern])
-        
-        # Add filename
         cmd.append(filename)
         
         print(f"Executing: {' '.join(cmd)}")
         
-        # Execute the grep command
+        # Execute grep
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=30  # 30 second timeout
+            timeout=30
         )
         
-        # Get the output
-        output_lines = result.stdout.strip().split('\n') if result.stdout.strip() else []
-        line_count = len(output_lines) if output_lines != [''] else 0
+        # Process output
+        if result.returncode == 0:
+            # Matches found
+            output_lines = result.stdout.strip().split('\n') if result.stdout.strip() else []
+            line_count = len(output_lines) if output_lines != [''] else 0
+        elif result.returncode == 1:
+            # No matches found (this is not an error)
+            output_lines = []
+            line_count = 0
+        else:
+            # Actual error
+            return {
+                'success': False,
+                'results': [],
+                'line_count': 0,
+                'filename': filename,
+                'error': f'Grep error: {result.stderr}'
+            }
         
         return {
             'success': True,
@@ -71,14 +123,6 @@ def execute_grep(pattern, filename, grep_options=None):
             'filename': filename,
             'error': 'Grep command timed out'
         }
-    except FileNotFoundError:
-        return {
-            'success': False,
-            'results': [],
-            'line_count': 0,
-            'filename': filename,
-            'error': f'File not found: {filename}'
-        }
     except Exception as e:
         return {
             'success': False,
@@ -89,25 +133,17 @@ def execute_grep(pattern, filename, grep_options=None):
         }
 
 def parse_grep_request(request_data):
-    """
-    Parse the JSON request from the client.
-    
-    Args:
-        request_data (str): JSON string containing grep request
-    
-    Returns:
-        dict: Parsed request with 'pattern', 'filename', and 'options' keys
-    """
+    """Parse the JSON request from the client."""
     try:
         request = json.loads(request_data)
         
-        # Validate required fields
         if 'pattern' not in request:
             raise ValueError("Missing 'pattern' field in request")
         
-        # Set defaults
         pattern = request['pattern']
-        filename = request.get('filename', 'machine.1.log')  # Default to machine.1.log
+        
+        # Use the filename from request, or default to this VM's log file
+        filename = request.get('filename', get_log_filename())
         options = request.get('options', [])
         
         return {
@@ -121,101 +157,75 @@ def parse_grep_request(request_data):
         raise ValueError(f"Error parsing request: {str(e)}")
 
 def send_response(client_socket, response_data):
-    """
-    Send a JSON response back to the client.
-    
-    Args:
-        client_socket: The client socket to send data to
-        response_data (dict): The response data to send
-    """
+    """Send a JSON response back to the client."""
     try:
-        # Convert response to JSON and encode
         response_json = json.dumps(response_data)
-        
-        # Send the length of the message first (for proper message framing)
         message_length = len(response_json.encode('utf-8'))
-        length_header = f"{message_length:010d}".encode('utf-8')  # 10-digit length
+        length_header = f"{message_length:010d}".encode('utf-8')
         
-        # Send length header followed by the actual message
         client_socket.send(length_header)
         client_socket.send(response_json.encode('utf-8'))
-        
     except Exception as e:
         print(f"Error sending response: {e}")
 
 def receive_request(client_socket):
-    """
-    Receive a complete request from the client.
-    
-    Args:
-        client_socket: The client socket to receive data from
-    
-    Returns:
-        str: The received request data
-    """
+    """Receive a complete request from the client."""
     try:
-        # First, receive the 10-byte length header
+        # Receive length header
         length_data = b''
+        client_socket.settimeout(10)  # 10 second timeout for receiving
+        
         while len(length_data) < 10:
             chunk = client_socket.recv(10 - len(length_data))
             if not chunk:
                 raise ConnectionError("Client disconnected")
             length_data += chunk
         
-        # Parse the message length
         message_length = int(length_data.decode('utf-8'))
         
-        # Now receive the actual message
+        # Receive actual message
         message_data = b''
         while len(message_data) < message_length:
-            chunk = client_socket.recv(message_length - len(message_data))
+            chunk = client_socket.recv(min(4096, message_length - len(message_data)))
             if not chunk:
                 raise ConnectionError("Client disconnected")
             message_data += chunk
         
         return message_data.decode('utf-8')
-        
+    except socket.timeout:
+        raise ConnectionError("Request timeout")
     except Exception as e:
         raise ConnectionError(f"Error receiving request: {e}")
 
 def handle_client(client_socket, client_address):
-    """
-    Handle individual client connection.
-    Receives grep requests and sends back results.
-    
-    Args:
-        client_socket: The socket connection to the client
-        client_address: The client's address (IP, port)
-    """
+    """Handle individual client connection."""
     try:
-        print(f"server: got connection from {client_address[0]}")
+        print(f"Connection from {client_address[0]}:{client_address[1]}")
         
-        # Receive the request from client
+        # Receive request
         request_data = receive_request(client_socket)
-        print(f"Received request: {request_data}")
+        print(f"Received request: {request_data[:100]}...")  # Print first 100 chars
         
-        # Parse the grep request
+        # Parse request
         try:
             request = parse_grep_request(request_data)
             
-            # Execute the grep command
+            # Execute grep
             result = execute_grep(
-                request['pattern'], 
-                request['filename'], 
+                request['pattern'],
+                request['filename'],
                 request['options']
             )
             
-            # Send the result back to client
+            # Send response
             send_response(client_socket, result)
             
-            # Log the result
             if result['success']:
-                print(f"Grep completed: found {result['line_count']} matches")
+                print(f"Grep completed: {result['line_count']} matches in {result['filename']}")
             else:
                 print(f"Grep failed: {result['error']}")
                 
         except ValueError as e:
-            # Send error response for invalid requests
             error_response = {
                 'success': False,
                 'results': [],
@@ -229,7 +239,6 @@ def handle_client(client_socket, client_address):
     except Exception as e:
         print(f"Error handling client: {e}")
         try:
-            # Try to send an error response
             error_response = {
                 'success': False,
                 'results': [],
@@ -239,56 +248,58 @@ def handle_client(client_socket, client_address):
             }
             send_response(client_socket, error_response)
         except:
-            pass  # If we can't send error response, just close connection
+            pass
     finally:
         client_socket.close()
-        print(f"Connection with {client_address[0]} closed")
+        print(f"Connection closed: {client_address[0]}:{client_address[1]}")
 
 def signal_handler(sig, frame):
-    """
-    Handle SIGINT (Ctrl+C) gracefully.
-    
-    Args:
-        sig: Signal number
-        frame: Current stack frame
-    """
+    """Handle SIGINT (Ctrl+C) gracefully."""
     print("\nShutting down server...")
     sys.exit(0)
 
 def main():
-    """
-    Main server function. Sets up the socket server and handles connections.
-    """
-    # Set up signal handler for graceful shutdown
+    """Main server function."""
     signal.signal(signal.SIGINT, signal_handler)
     
-    # Create socket
+    # Determine VM ID and log file
+    vm_id = get_vm_id()
+    log_file = get_log_filename()
+    
+    print(f"{'='*60}")
+    print(f"Distributed Grep Server")
+    print(f"VM ID: {vm_id if vm_id else 'Unknown'}")
+    print(f"Default log file: {log_file}")
+    print(f"Port: {PORT}")
+    print(f"{'='*60}\n")
+    
+    # Check if log file exists
+    if not os.path.exists(log_file):
+        print(f"Warning: Log file '{log_file}' not found in current directory")
+        print("Server will report errors if clients request this file\n")
+    
     try:
+        # Create and configure socket
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        
-        # Allow socket reuse (prevents "Address already in use" errors)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         
-        # Bind to address and port
+        # Bind to all interfaces
         server_socket.bind(('', PORT))
-        
-        # Listen for connections
         server_socket.listen(BACKLOG)
         
-        print(f"Distributed Grep Server listening on port {PORT}")
-        print("Waiting for grep requests...")
+        print(f"Server listening on all interfaces, port {PORT}")
+        print("Waiting for grep requests...\n")
         
         while True:
             try:
-                # Accept connection
                 client_socket, client_address = server_socket.accept()
                 
-                # Handle client in a separate thread
+                # Handle each client in a separate thread
                 client_thread = Thread(
-                    target=handle_client, 
+                    target=handle_client,
                     args=(client_socket, client_address)
                 )
-                client_thread.daemon = True  # Thread will exit when main program exits
+                client_thread.daemon = True
                 client_thread.start()
                 
             except socket.error as e:

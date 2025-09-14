@@ -1,0 +1,76 @@
+{
+    "vms": [
+        {
+            "id": 1,
+            "hostname": "fa25-cs425-a701.cs.illinois.edu",
+            "ip": "172.22.159.101",
+            "port": 3490,
+            "log_file": "machine.1.log"
+        },
+        {
+            "id": 2,
+            "hostname": "fa25-cs425-a702.cs.illinois.edu",
+            "ip": "172.22.155.175",
+            "port": 3490,
+            "log_file": "machine.2.log"
+        },
+        {
+            "id": 3,
+            "hostname": "fa25-cs425-a703.cs.illinois.edu",
+            "ip": "172.22.155.100",
+            "port": 3490,
+            "log_file": "machine.3.log"
+        },
+        {
+            "id": 4,
+            "hostname": "fa25-cs425-a704.cs.illinois.edu",
+            "ip": "172.22.159.102",
+            "port": 3490,
+            "log_file": "machine.4.log"
+        },
+        {
+            "id": 5,
+            "hostname": "fa25-cs425-a705.cs.illinois.edu",
+            "ip": "172.22.155.176",
+            "port": 3490,
+            "log_file": "machine.5.log"
+        },
+        {
+            "id": 6,
+            "hostname": "fa25-cs425-a706.cs.illinois.edu",
+            "ip": "172.22.155.101",
+            "port": 3490,
+            "log_file": "machine.6.log"
+        },
+        {
+            "id": 7,
+            "hostname": "fa25-cs425-a707.cs.illinois.edu",
+            "ip": "172.22.159.103",
+            "port": 3490,
+            "log_file": "machine.7.log"
+        },
+        {
+            "id": 8,
+            "hostname": "fa25-cs425-a708.cs.illinois.edu",
+            "ip": "172.22.155.177",
+            "port": 3490,
+            "log_file": "machine.8.log"
+        },
+        {
+            "id": 9,
+            "hostname": "fa25-cs425-a709.cs.illinois.edu",
+            "ip": "172.22.155.102",
+            "port": 3490,
+            "log_file": "machine.9.log"
+        },
+        {
+            "id": 10,
+            "hostname": "fa25-cs425-a710.cs.illinois.edu",
+            "ip": "172.22.159.104",
+            "port": 3490,
+            "log_file": "machine.10.log"
+        }
+    ],
+    "timeout": 5,
+    "parallel": true
+}
