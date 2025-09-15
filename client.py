@@ -1,315 +1,170 @@
-#!/usr/bin/env python3
-"""
-Distributed Grep Client
-Queries all VMs in parallel and aggregates results
-"""
+## Adapted from Beej's guide
 
 import socket
-import sys
 import json
-import argparse
+import sys
 import time
-from threading import Thread, Lock
-from collections import defaultdict
+import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Configuration file path
-CONFIG_FILE = 'config.json'
-MAXDATASIZE = 4096
+PORT = 3490
+TIMEOUT = 720
+VM_COUNT = 10
 
-# Global variables for result aggregation
-results_lock = Lock()
-all_results = {}
-total_matches = 0
-failed_vms = []
-
-def load_config():
-    """Load VM configuration from JSON file."""
+# sends grep pattern and requirements to server, receives response
+def query_server(vm_info, pattern, options):
     try:
-        with open(CONFIG_FILE, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        print(f"Error: Configuration file '{CONFIG_FILE}' not found.")
-        sys.exit(1)
-    except json.JSONDecodeError:
-        print(f"Error: Invalid JSON in '{CONFIG_FILE}'.")
-        sys.exit(1)
-
-def send_request(client_socket, request_data):
-    """Send a JSON request to the server."""
-    try:
-        request_json = json.dumps(request_data)
-        message_length = len(request_json.encode('utf-8'))
-        length_header = f"{message_length:010d}".encode('utf-8')
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(TIMEOUT)
         
-        client_socket.send(length_header)
-        client_socket.send(request_json.encode('utf-8'))
-    except Exception as e:
-        raise ConnectionError(f"Error sending request: {e}")
-
-def receive_response(client_socket):
-    """Receive a complete response from the server."""
-    try:
-        # Receive length header
-        length_data = b''
-        while len(length_data) < 10:
-            chunk = client_socket.recv(10 - len(length_data))
-            if not chunk:
-                raise ConnectionError("Server disconnected")
-            length_data += chunk
+        s.connect((vm_info['ip'], PORT))
         
-        message_length = int(length_data.decode('utf-8'))
-        
-        # Receive actual message
-        message_data = b''
-        while len(message_data) < message_length:
-            remaining = min(MAXDATASIZE, message_length - len(message_data))
-            chunk = client_socket.recv(remaining)
-            if not chunk:
-                raise ConnectionError("Server disconnected")
-            message_data += chunk
-        
-        response_json = message_data.decode('utf-8')
-        return json.loads(response_json)
-    except json.JSONDecodeError:
-        raise ValueError("Invalid JSON response from server")
-    except Exception as e:
-        raise ConnectionError(f"Error receiving response: {e}")
-
-def query_single_vm(vm_info, pattern, grep_options, timeout):
-    """
-    Query a single VM for grep results.
-    
-    Args:
-        vm_info (dict): VM configuration (id, hostname, port, log_file)
-        pattern (str): The grep pattern
-        grep_options (list): Grep options
-        timeout (int): Connection timeout in seconds
-    """
-    global all_results, total_matches, failed_vms
-    
-    vm_id = vm_info['id']
-    hostname = vm_info['hostname']
-    port = vm_info['port']
-    log_file = vm_info['log_file']
-    
-    try:
-        # Create socket with timeout
-        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        client_socket.settimeout(timeout)
-        
-        # Try hostname first, fall back to IP if needed
-        try:
-            client_socket.connect((hostname, port))
-        except socket.gaierror:
-            # If hostname fails, try IP
-            client_socket.connect((vm_info['ip'], port))
-        
-        # Build and send request
         request = {
             'pattern': pattern,
-            'filename': log_file,
-            'options': grep_options
+            'options': options
         }
+        s.send(json.dumps(request).encode('utf-8'))
         
-        send_request(client_socket, request)
+        size_header = s.recv(10)
+        if not size_header:
+            return None
         
-        # Receive response
-        response = receive_response(client_socket)
+        response_size = int(size_header.decode('utf-8'))
         
-        # Store results
-        with results_lock:
-            if response['success']:
-                all_results[vm_id] = {
-                    'hostname': hostname,
-                    'results': response['results'],
-                    'line_count': response['line_count'],
-                    'filename': response['filename']
-                }
-                total_matches += response['line_count']
-            else:
-                failed_vms.append({
-                    'vm_id': vm_id,
-                    'hostname': hostname,
-                    'error': response.get('error', 'Unknown error')
-                })
+        response_data = b''
+        while len(response_data) < response_size:
+            chunk = s.recv(min(4096, response_size - len(response_data)))
+            if not chunk:
+                break
+            response_data += chunk
         
-        client_socket.close()
+        s.close()
         
-    except (socket.timeout, socket.error, ConnectionError) as e:
-        with results_lock:
-            failed_vms.append({
-                'vm_id': vm_id,
-                'hostname': hostname,
-                'error': f"Connection failed: {str(e)}"
-            })
-    except Exception as e:
-        with results_lock:
-            failed_vms.append({
-                'vm_id': vm_id,
-                'hostname': hostname,
-                'error': f"Unexpected error: {str(e)}"
-            })
+        response = json.loads(response_data.decode('utf-8'))
+        return response
+        
+    except socket.timeout:
+        return {
+            'vm_id': vm_info['id'],
+            'count': 0,
+            'lines': [],
+            'error': 'Connection timeout'
+        }
+    except Exception as e: # catchall for any exceptions/errors
+        return {
+            'vm_id': vm_info['id'],
+            'count': 0,
+            'lines': [],
+            'error': str(e)
+        }
 
-def display_results(pattern, show_line_numbers=False):
-    """
-    Display aggregated results from all VMs.
-    
-    Args:
-        pattern (str): The search pattern (for display)
-        show_line_numbers (bool): Whether line numbers are included
-    """
-    print(f"\n{'='*70}")
-    print(f"Distributed Grep Results for pattern: '{pattern}'")
-    print(f"{'='*70}\n")
-    
-    # Display results from successful VMs
-    if all_results:
-        for vm_id in sorted(all_results.keys()):
-            result = all_results[vm_id]
-            hostname = result['hostname']
-            line_count = result['line_count']
-            filename = result['filename']
-            
-            if line_count > 0:
-                print(f"VM{vm_id} ({hostname}) - {filename}: {line_count} match(es)")
-                print("-" * 50)
-                for line in result['results']:
-                    # Add VM identifier to each line
-                    print(f"VM{vm_id}:{filename}:{line}")
-                print()
-    
-    # Display failed VMs
-    if failed_vms:
-        print(f"\n{'='*70}")
-        print("Failed to query the following VMs:")
-        print("-" * 50)
-        for failed in failed_vms:
-            print(f"VM{failed['vm_id']} ({failed['hostname']}): Unable to retrieve data")
-    
-    # Summary
-    print(f"\n{'='*70}")
-    print(f"Summary:")
-    print(f"  Total VMs queried: {len(all_results) + len(failed_vms)}")
-    print(f"  Successful queries: {len(all_results)}")
-    print(f"  Failed queries: {len(failed_vms)}")
-    print(f"  Total matches found: {total_matches}")
-    print(f"{'='*70}\n")
-
-def parse_arguments():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(
-        description='Distributed Grep Client - Search all VMs for patterns',
-        epilog='Example: python3 distributed_client.py "error" -i'
-    )
-    
-    parser.add_argument(
-        'pattern',
-        help='The search pattern (regex) to grep for'
-    )
-    
-    parser.add_argument(
-        '-i', '--ignore-case',
-        action='store_true',
-        help='Ignore case distinctions'
-    )
-    
-    parser.add_argument(
-        '-n', '--line-number',
-        action='store_true',
-        help='Show line numbers with output'
-    )
-    
-    parser.add_argument(
-        '-v', '--invert-match',
-        action='store_true',
-        help='Select non-matching lines'
-    )
-    
-    parser.add_argument(
-        '-c', '--count',
-        action='store_true',
-        help='Only print count of matching lines'
-    )
-    
-    parser.add_argument(
-        '--sequential',
-        action='store_true',
-        help='Query VMs sequentially instead of in parallel'
-    )
-    
-    return parser.parse_args()
-
-def build_grep_options(args):
-    """Build grep options from command line arguments."""
-    options = []
-    
-    if args.ignore_case:
-        options.append('-i')
-    if args.line_number:
-        options.append('-n')
-    if args.invert_match:
-        options.append('-v')
-    if args.count:
-        options.append('-c')
-    
-    return options
-
-def main():
-    """Main function - coordinates distributed grep across all VMs."""
-    global all_results, total_matches, failed_vms
-    
-    # Parse arguments
-    args = parse_arguments()
-    pattern = args.pattern
-    grep_options = build_grep_options(args)
-    
-    # Load configuration
-    config = load_config()
+# run the grep command on each VM, display results
+def run_grep(pattern, options='', verbose=False):
+    # config = load_config()
+    with open('config.json', 'r') as f:
+        config = json.load(f)
     vms = config['vms']
-    timeout = config.get('timeout', 5)
-    parallel = not args.sequential and config.get('parallel', True)
-    
-    # Reset global variables
-    all_results = {}
-    total_matches = 0
-    failed_vms = []
-    
-    print(f"\nQuerying {len(vms)} VMs for pattern '{pattern}'...")
-    print(f"Mode: {'Parallel' if parallel else 'Sequential'}")
-    print(f"Timeout: {timeout} seconds per VM\n")
+    # timeout = config.get('timeout', 5000) / 1000 
     
     start_time = time.time()
     
-    if parallel:
-        # Query all VMs in parallel using threads
-        threads = []
-        for vm_info in vms:
-            thread = Thread(
-                target=query_single_vm,
-                args=(vm_info, pattern, grep_options, timeout)
-            )
-            thread.start()
-            threads.append(thread)
+    print(f"\nExecuting grep: pattern='{pattern}' options='{options}'")
+    print("-" * 60)
+    
+    results = []
+    total_count = 0
+    failed_vms = []
+    vm_counts = {}  # Store count per VM
+    
+    with ThreadPoolExecutor(max_workers=VM_COUNT) as executor:
+        future_to_vm = {
+            executor.submit(query_server, vm, pattern, options): vm 
+            for vm in vms
+        }
         
-        # Wait for all threads to complete
-        for thread in threads:
-            thread.join()
-    else:
-        # Query VMs sequentially
-        for vm_info in vms:
-            query_single_vm(vm_info, pattern, grep_options, timeout)
+        for future in as_completed(future_to_vm):
+            vm = future_to_vm[future]
+            result = future.result()
+            
+            if result:
+                if result.get('error'):
+                    failed_vms.append((vm['id'], result['error']))
+                    vm_counts[vm['id']] = {'count': 0, 'status': 'FAILED', 'error': result['error']}
+                    if verbose:
+                        print(f"VM{vm['id']}: ERROR - {result['error']}")
+                else:
+                    results.append(result)
+                    total_count += result['count']
+                    vm_counts[vm['id']] = {'count': result['count'], 'status': 'SUCCESS'}
+                    if verbose:
+                        print(f"VM{vm['id']}: {result['count']} matches found")
+            else:
+                failed_vms.append((vm['id'], 'No response'))
+                vm_counts[vm['id']] = {'count': 0, 'status': 'FAILED', 'error': 'No response'}
+                if verbose:
+                    print(f"VM{vm['id']}: No response")
     
-    end_time = time.time()
-    query_time = end_time - start_time
+    print("\n\n")
     
-    # Display results
-    display_results(pattern, args.line_number)
+    for result in sorted(results, key=lambda x: x['vm_id']):
+        if result['lines']:
+            for line in result['lines']:
+                print(line)
     
-    print(f"Total query time: {query_time:.2f} seconds")
+    print("\n\n")
     
-    # Exit with error code if all queries failed
-    if len(failed_vms) == len(vms):
-        sys.exit(1)
+    print("Line counts:")
+    for vm_id in sorted(vm_counts.keys()):
+        vm_info = vm_counts[vm_id]
+        log_file = f"machine.{vm_id}.log"
+        
+        if vm_info['status'] == 'SUCCESS':
+            print(f"{log_file}: {vm_info['count']:6d}")
+        else:
+            print(f"{log_file}: FAILED - {vm_info['error']}")
+    
+    print(f"\nSum of line counts: {total_count}")
+    print(f"Successful VMs: {len(results)}/{len(vms)}")
+    
+    if failed_vms:
+        print(f"Failed VMs: {len(failed_vms)}")
+    
+    elapsed_time = time.time() - start_time
+    print(f"\nQuery completed in {elapsed_time:.3f} seconds")
+    
+    return total_count, results, failed_vms
+
+# main, also parse flags
+def main():
+    parser = argparse.ArgumentParser(description='Distributed Log Query Client')
+    parser.add_argument('pattern', help='Grep pattern to search for')
+    parser.add_argument('-e', '--regexp', action='store_true', 
+                       help='Use extended regular expressions')
+    parser.add_argument('-i', '--ignore-case', action='store_true',
+                       help='Ignore case distinctions')
+    parser.add_argument('-c', '--count', action='store_true',
+                       help='Only print count of matching lines')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                       help='Verbose output')
+    parser.add_argument('-n', '--line-number', action='store_true',
+                       help='Output with line numbers')
+    parser.add_argument('--options', default='',
+                       help='Additional grep options')
+    
+    args = parser.parse_args()
+    
+    options = args.options
+    if args.regexp:
+        options += ' -E'
+    if args.ignore_case:
+        options += ' -i'
+    if args.count:
+        options += ' -c'
+    if args.line_number:
+        options += ' -n'
+    
+    run_grep(args.pattern, options.strip(), args.verbose)
+
 
 if __name__ == "__main__":
     main()
