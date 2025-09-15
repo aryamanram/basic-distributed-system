@@ -1,136 +1,79 @@
-## Adapted from Beej's guide
+# Server.py
 
 import socket
-import subprocess
 import json
-import threading
-import os
-import sys
-import signal
+from subprocess import check_output
 
-PORT = 3490
+HOST = socket.gethostname()
+PORT = 8080
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
 
-# load info form config file
-def load_config():
-    with open('config.json', 'r') as f:
-        config = json.load(f)
-    
-    hostname = socket.gethostname()
-    vm_config = None
-    
-    for vm in config['vms']:
-        if vm['hostname'] == hostname:
-            vm_config = vm
-            break
-    
-    if not vm_config:
-        local_ip = socket.gethostbyname(hostname)
-        for vm in config['vms']:
-            if vm['ip'] == local_ip:
-                vm_config = vm
-                break
-    
-    if not vm_config:
-        print(f"Error: Could not find {hostname}")
-        sys.exit(1)
-    
-    return vm_config
+    s.bind((HOST, PORT))
+    print(f"Socket bound to {HOST} to port {PORT}")
+    s.listen()
+    print("Listening for connections...")
 
-# receive grep specs, run grep, send back results
-def run_client_grep(c, addr, vm_config):
-    try:
-        data = c.recv(4096).decode('utf-8')
-        if not data:
-            return
-        
-        request = json.loads(data)
-        grep_pattern = request.get('pattern', '')
-        grep_options = request.get('options', '')
-        
-        vm_id = vm_config['id']
-        log_file = vm_config['log_file']
-        
-        try:
-            if grep_options:
-                cmd = f"grep {grep_options} '{grep_pattern}' {log_file}"
-            else:
-                cmd = f"grep '{grep_pattern}' {log_file}"
-            
-            result = subprocess.run(
-                cmd,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            
-            lines = []
-            if result.stdout:
-                lines = result.stdout.strip().split('\n')
-                lines = [f"{log_file}:{line}" for line in lines if line]
-            
-            response = {
-                'vm_id': vm_id,
-                'count': len(lines),
-                'lines': lines[:1000],
-                'error': None
-            }
-        except Exception as e:
-            response = {
-                'vm_id': vm_id,
-                'count': 0,
-                'lines': [],
-                'error': str(e)
-            }
-        
-        response_data = json.dumps(response).encode('utf-8')
-        size_header = f"{len(response_data):010d}".encode('utf-8')
-        c.send(size_header)
-        c.send(response_data)
-        
-    except Exception as e:
-        print(f"Error handling client: {e}")
-    finally:
-        c.close()
+    while True: # To keep listening for further queries
+        conn, addr = s.accept()
+        with conn:
+            print(f"Connected by {addr}") # Which machine is making the connection
+            try:
 
-# main function, socket connection
-def main():
-    vm_config = load_config()
-    port = PORT
-    vm_id = vm_config['id']
-    log_file = vm_config['log_file']
-    
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    
-    s.bind(('0.0.0.0', port))
-    s.listen(10)
-    
-    print(f"Server VM{vm_id}, port {port}")
-    print(f"Log file: {log_file}")
-    
-    def signal_handler(sig, frame):
-        print("\nShutting down server...")
-        s.close()
-        sys.exit(0)
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    
-    while True:
-        try:
-            c, addr = s.accept()
-            thread = threading.Thread(
-                target=run_client_grep,
-                args=(c, addr, vm_config)
-            )
-            thread.daemon = True
-            thread.start()
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            print(f"Error accepting connection: {e}")
-    
-    s.close()
+                data = conn.recv(1024) # Receiving data packet
+                decodeddata = data.decode('utf-8') # Decoding data
+                load = json.loads(decodeddata) # loading JSON data to python readable dictionary
+                
+                command = load["command_parameters"][0] # Command passed, in this case it is grep
+                input_command_list = load["command_parameters"] # All parameters passed to the terminal
+                pattern = ""
+                option = "-n" # Default -n parameter to get the line number for the output
+                optione = False # Flag for the -E parameter
+                for parameter in input_command_list:
+                    if parameter.lower()!="grep" and parameter[0]!="-":
+                        pattern = pattern + parameter + " "
+                    if parameter == "-E":
+                        optione = True
+                    if parameter == "-c":
+                        option = "-c"
+                    if parameter == "-Ec":
+                        option = "-Ec"
+                pattern = pattern[0:len(pattern)-1]
+                if pattern[0] == "\"":
+                    pattern = pattern[1:]
+                if pattern[len(pattern)-1] == "\"":
+                    pattern = pattern[:len(pattern)-1]
 
-if __name__ == "__main__":
-    main()
+                command_list = []
+                command_list.append(command)
+                command_list.append(option)
+                if optione:
+                    command_list.append("-E")
+                command_list.append(pattern)
+                filename = HOST.split("-")[2][2:4]
+                command_list.append(f"machine.{filename}.log")        
+                #assume log file is already generated on machine
+                #run command: grep <options> <pattern> and store return value
+                print(f"Final Command to be run: {command_list}") 
+                log_string = check_output(command_list).decode("utf-8")
+                print(f"Output: {log_string}")
+                tempdict = {}
+                if not log_string[:-1].isdigit():
+                    for line in log_string.split("\r\n"):
+                        key = line.split(":")[0]
+                        value = "".join(line.split(":")[1:])
+                        if key != "" and value != "":
+                            tempdict[key] = value
+                    count = len(tempdict.keys())
+                else:
+                    tempdict[0] = "Passed -c as a parameter"
+                    count = log_string[:-1]
+                
+                #out_dict sends dictionary back. key: inputted log file, value: grep output from inputted log file w/ Line numbers
+                out_dict = {}
+                filename_string = f"machine.{filename}.log"
+                out_dict[filename_string] = tempdict
+                out_dict["count"]=count
+                print(out_dict) # Final Output from the Command
+                conn.sendall(json.dumps(out_dict).encode('utf-8'))
+            except Exception as e:
+                print(e)
