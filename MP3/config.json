@@ -1,0 +1,56 @@
+{
+    "vms": [
+        {
+            "id": 1,
+            "hostname": "fa25-cs425-a701.cs.illinois.edu",
+            "ip": "172.22.159.101"
+        },
+        {
+            "id": 2,
+            "hostname": "fa25-cs425-a702.cs.illinois.edu",
+            "ip": "172.22.155.175"
+        },
+        {
+            "id": 3,
+            "hostname": "fa25-cs425-a703.cs.illinois.edu",
+            "ip": "172.22.155.100"
+        },
+        {
+            "id": 4,
+            "hostname": "fa25-cs425-a704.cs.illinois.edu",
+            "ip": "172.22.159.102"
+        },
+        {
+            "id": 5,
+            "hostname": "fa25-cs425-a705.cs.illinois.edu",
+            "ip": "172.22.155.176"
+        },
+        {
+            "id": 6,
+            "hostname": "fa25-cs425-a706.cs.illinois.edu",
+            "ip": "172.22.155.101"
+        },
+        {
+            "id": 7,
+            "hostname": "fa25-cs425-a707.cs.illinois.edu",
+            "ip": "172.22.159.103"
+        },
+        {
+            "id": 8,
+            "hostname": "fa25-cs425-a708.cs.illinois.edu",
+            "ip": "172.22.155.177"
+        },
+        {
+            "id": 9,
+            "hostname": "fa25-cs425-a709.cs.illinois.edu",
+            "ip": "172.22.155.102"
+        },
+        {
+            "id": 10,
+            "hostname": "fa25-cs425-a710.cs.illinois.edu",
+            "ip": "172.22.159.104"
+        }
+    ],
+    "replication_factor": 3,
+    "hydfs_port": 7000
+}
