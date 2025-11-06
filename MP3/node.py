@@ -125,6 +125,7 @@ class HyDFSNode:
         srv.listen(8)
         
         while self.running:
+            conn = None
             try:
                 conn, addr = srv.accept()
                 
@@ -152,10 +153,27 @@ class HyDFSNode:
                 size_header = f"{len(response_data):010d}".encode('utf-8')
                 conn.sendall(size_header + response_data)
                 
-                conn.close()
             except Exception as e:
                 if self.running:
                     self.logger.log(f"CONTROL ERROR: {e}")
+                    import traceback
+                    self.logger.log(traceback.format_exc())
+                    
+                    # Try to send error response
+                    if conn:
+                        try:
+                            error_response = {'status': 'error', 'message': str(e)}
+                            response_data = json.dumps(error_response).encode('utf-8')
+                            size_header = f"{len(response_data):010d}".encode('utf-8')
+                            conn.sendall(size_header + response_data)
+                        except:
+                            pass
+            finally:
+                if conn:
+                    try:
+                        conn.close()
+                    except:
+                        pass
     
     def _handle_control_command(self, command: dict) -> dict:
         """
@@ -164,10 +182,16 @@ class HyDFSNode:
         try:
             cmd_type = command.get('type')
             
+            if not cmd_type:
+                return {'status': 'error', 'message': 'No command type specified'}
+            
             # Handle special controller commands
             if cmd_type == 'APPEND':
                 # Controller-based append with client generation
                 filename = command.get('filename')
+                if not filename:
+                    return {'status': 'error', 'message': 'No filename specified'}
+                
                 data = bytes(command.get('data', []))
                 
                 # Generate client ID
@@ -189,6 +213,9 @@ class HyDFSNode:
                 
                 # Get replicas
                 replicas = self.get_replicas_for_file(filename)
+                
+                if not replicas:
+                    return {'status': 'error', 'message': 'No replicas available'}
                 
                 # Send to all replicas
                 success_count = 0
@@ -225,10 +252,16 @@ class HyDFSNode:
             elif cmd_type == 'CREATE':
                 # Controller-based create
                 filename = command.get('filename')
+                if not filename:
+                    return {'status': 'error', 'message': 'No filename specified'}
+                
                 data = bytes(command.get('data', []))
                 
                 # Get replicas
                 replicas = self.get_replicas_for_file(filename)
+                
+                if not replicas:
+                    return {'status': 'error', 'message': 'No replicas available'}
                 
                 # Send to all replicas
                 success_count = 0
@@ -256,15 +289,28 @@ class HyDFSNode:
             
             # Delegate to existing handlers
             elif cmd_type in self.network.handlers:
-                # Create a fake address tuple
-                response = self.network.handlers[cmd_type](command, ('controller', 0))
-                return response
+                try:
+                    # Create a fake address tuple
+                    response = self.network.handlers[cmd_type](command, ('controller', 0))
+                    
+                    # Ensure response is a dict
+                    if not isinstance(response, dict):
+                        return {'status': 'error', 'message': f'Handler returned invalid response type: {type(response)}'}
+                    
+                    return response
+                except Exception as handler_error:
+                    import traceback
+                    error_msg = f'Handler error: {str(handler_error)}\n{traceback.format_exc()}'
+                    self.logger.log(f"CONTROL HANDLER ERROR for {cmd_type}: {error_msg}")
+                    return {'status': 'error', 'message': error_msg}
             
             return {'status': 'error', 'message': f'Unknown command type: {cmd_type}'}
         
         except Exception as e:
             import traceback
-            return {'status': 'error', 'message': f'{str(e)}\n{traceback.format_exc()}'}
+            error_msg = f'{str(e)}\n{traceback.format_exc()}'
+            self.logger.log(f"CONTROL ERROR: {error_msg}")
+            return {'status': 'error', 'message': error_msg}
     
     def _monitor_membership(self):
         """

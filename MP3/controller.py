@@ -65,6 +65,7 @@ class HyDFSController:
         """
         Send a command to a specific VM and get response.
         """
+        sock = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(30.0)
@@ -78,9 +79,16 @@ class HyDFSController:
             # Receive response
             size_header = sock.recv(10)
             if not size_header:
-                return {"status": "error", "message": "No response"}
+                return {"status": "error", "message": "No response from server"}
             
-            size = int(size_header.decode('utf-8'))
+            # Debug: Check if we got a valid size header
+            try:
+                size = int(size_header.decode('utf-8'))
+            except ValueError as e:
+                # Got unexpected data instead of size header
+                error_msg = f"Invalid size header: {size_header[:50]}"
+                return {"status": "error", "message": error_msg}
+            
             response_data = b''
             while len(response_data) < size:
                 chunk = sock.recv(min(4096, size - len(response_data)))
@@ -90,12 +98,24 @@ class HyDFSController:
             
             sock.close()
             
-            return json.loads(response_data.decode('utf-8'))
+            # Parse response
+            try:
+                return json.loads(response_data.decode('utf-8'))
+            except json.JSONDecodeError as e:
+                return {"status": "error", "message": f"Invalid JSON response: {str(e)}"}
         
         except socket.timeout:
             return {"status": "error", "message": "Connection timeout"}
+        except ConnectionRefusedError:
+            return {"status": "error", "message": "Connection refused - is the node running?"}
         except Exception as e:
-            return {"status": "error", "message": str(e)}
+            return {"status": "error", "message": f"Connection error: {str(e)}"}
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except:
+                    pass
     
     def execute_on_vms(self, vm_ids: Set[int], command: dict):
         """
@@ -114,7 +134,12 @@ class HyDFSController:
                 if 'message' in response:
                     print(f"  {response['message']}")
                 if 'data' in response:
-                    print(f"  {response['data']}")
+                    # Don't print raw data, just size
+                    data = response.get('data', [])
+                    if isinstance(data, list):
+                        print(f"  Data: {len(data)} bytes")
+                    else:
+                        print(f"  {response['data']}")
                 if 'files' in response:
                     files = response['files']
                     print(f"  Files ({len(files)}):")
@@ -131,7 +156,18 @@ class HyDFSController:
                     for m in members:
                         print(f"    - Ring {m['ring_position']}: {m['hostname']} ({m['status']})")
             else:
-                print(f"  Error: {response.get('message', 'Unknown error')}")
+                error_msg = response.get('message', 'Unknown error')
+                print(f"  Error: {error_msg}")
+                # If error is long (like a traceback), print first few lines
+                if '\n' in error_msg:
+                    lines = error_msg.split('\n')
+                    print(f"  Error details:")
+                    for line in lines[:10]:  # Show first 10 lines
+                        if line.strip():
+                            print(f"    {line}")
+                    if len(lines) > 10:
+                        print(f"    ... ({len(lines) - 10} more lines)")
+
     
     def read_local_file(self, filename: str) -> bytes:
         """
