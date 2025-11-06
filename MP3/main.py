@@ -1,16 +1,19 @@
 """
-HyDFS Main - Command Line Interface
+HyDFS Main - Command Line Interface with Control Server
 """
 import argparse
 import os
 import sys
 import time
 import socket
+import threading
 from typing import Optional
 
 from node import HyDFSNode, HYDFS_PORT
 from storage import FileBlock
 from utils import get_file_id
+
+HYDFS_CONTROL_PORT = 9091
 
 def read_local_file(filename: str) -> Optional[bytes]:
     """
@@ -367,8 +370,6 @@ class HyDFSClient:
         print(f"VMs: {vm_addresses}")
         print(f"Files: {local_filenames}")
         
-        import threading
-        
         def append_from_vm(vm_addr, local_file):
             # Create a temporary client
             temp_client = HyDFSClient(self.node)
@@ -387,54 +388,26 @@ class HyDFSClient:
         
         print("Multi-append completed")
 
-def main():
-    parser = argparse.ArgumentParser(description='HyDFS - Hybrid Distributed File System')
-    parser.add_argument('--vm-id', type=int, required=True, help='VM ID (1-10)')
+def execute_command(client: HyDFSClient, cmd: str) -> str:
+    """
+    Execute a HyDFS command and return the result as a string.
+    Used by the control server.
+    """
+    import io
+    import contextlib
     
-    args = parser.parse_args()
+    # Capture stdout
+    output = io.StringIO()
     
-    # Create and start node
-    node = HyDFSNode(args.vm_id)
-    node.start()
-    
-    # Join the group
-    print("\nJoining group...")
-    node.membership.join_group()
-    time.sleep(2)  # Wait for membership to stabilize
-    
-    # Create client
-    client = HyDFSClient(node)
-    
-    print("\n" + "="*60)
-    print("HyDFS Command Interface")
-    print("="*60)
-    print("Commands:")
-    print("  create <local> <hydfs>")
-    print("  get <hydfs> <local>")
-    print("  append <local> <hydfs>")
-    print("  merge <hydfs>")
-    print("  ls <hydfs>")
-    print("  liststore")
-    print("  getfromreplica <vm_address> <hydfs> <local>")
-    print("  list_mem_ids")
-    print("  multiappend <hydfs> <vm1,vm2,...> <file1,file2,...>")
-    print("  quit")
-    print("="*60 + "\n")
-    
-    # Command loop
-    while True:
+    with contextlib.redirect_stdout(output):
         try:
-            cmd = input("hydfs> ").strip()
-            if not cmd:
-                continue
+            parts = cmd.strip().split()
+            if not parts:
+                return "Error: Empty command"
             
-            parts = cmd.split()
             command = parts[0].lower()
             
-            if command == 'quit' or command == 'exit':
-                break
-            
-            elif command == 'create' and len(parts) == 3:
+            if command == 'create' and len(parts) == 3:
                 client.create(parts[1], parts[2])
             
             elif command == 'get' and len(parts) == 3:
@@ -466,17 +439,154 @@ def main():
                 else:
                     print("Error: Number of VMs and files must match")
             
+            elif command == 'status':
+                print(f"OK - VM{client.node.vm_id}")
+            
             else:
                 print(f"Unknown command or invalid arguments: {cmd}")
-                print("Type 'help' for command list")
         
-        except KeyboardInterrupt:
-            print("\nExiting...")
-            break
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Error executing command: {e}")
             import traceback
             traceback.print_exc()
+    
+    return output.getvalue()
+
+def control_server_loop(client: HyDFSClient, logger):
+    """
+    Run a control server that listens for commands from the controller.
+    """
+    try:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(('', HYDFS_CONTROL_PORT))
+        srv.listen(8)
+        
+        logger.log(f"CONTROL: Server listening on port {HYDFS_CONTROL_PORT}")
+        
+        while True:
+            try:
+                conn, addr = srv.accept()
+                # Handle in separate thread
+                threading.Thread(
+                    target=handle_control_connection,
+                    args=(conn, addr, client, logger),
+                    daemon=True
+                ).start()
+            except Exception as e:
+                logger.log(f"CONTROL ERROR: Accept: {e}")
+    
+    except Exception as e:
+        logger.log(f"CONTROL ERROR: Server: {e}")
+
+def handle_control_connection(conn, addr, client, logger):
+    """
+    Handle a single control connection.
+    """
+    try:
+        # Receive command
+        cmd = conn.recv(8192).decode('utf-8').strip()
+        logger.log(f"CONTROL: Received command from {addr[0]}: {cmd}")
+        
+        # Execute command
+        result = execute_command(client, cmd)
+        
+        # Send response
+        conn.sendall(result.encode('utf-8'))
+        
+    except Exception as e:
+        logger.log(f"CONTROL ERROR: Handle: {e}")
+        try:
+            conn.sendall(f"Error: {e}".encode('utf-8'))
+        except:
+            pass
+    finally:
+        try:
+            conn.close()
+        except:
+            pass
+
+def main():
+    parser = argparse.ArgumentParser(description='HyDFS - Hybrid Distributed File System')
+    parser.add_argument('--vm-id', type=int, required=True, help='VM ID (1-10)')
+    parser.add_argument('--no-interactive', action='store_true', 
+                       help='Disable interactive mode (control server only)')
+    
+    args = parser.parse_args()
+    
+    # Create and start node
+    node = HyDFSNode(args.vm_id)
+    node.start()
+    
+    # Join the group
+    print("\nJoining group...")
+    node.membership.join_group()
+    time.sleep(2)  # Wait for membership to stabilize
+    
+    # Create client
+    client = HyDFSClient(node)
+    
+    # Start control server in background
+    control_thread = threading.Thread(
+        target=control_server_loop,
+        args=(client, node.logger),
+        daemon=True
+    )
+    control_thread.start()
+    print(f"Control server started on port {HYDFS_CONTROL_PORT}")
+    
+    if args.no_interactive:
+        # No interactive mode - just keep running
+        print("\nRunning in non-interactive mode (control server only)")
+        print("Waiting for commands from controller...")
+        print("Press Ctrl+C to stop\n")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+    else:
+        # Interactive mode
+        print("\n" + "="*60)
+        print("HyDFS Command Interface")
+        print("="*60)
+        print("Commands:")
+        print("  create <local> <hydfs>")
+        print("  get <hydfs> <local>")
+        print("  append <local> <hydfs>")
+        print("  merge <hydfs>")
+        print("  ls <hydfs>")
+        print("  liststore")
+        print("  getfromreplica <vm_address> <hydfs> <local>")
+        print("  list_mem_ids")
+        print("  multiappend <hydfs> <vm1,vm2,...> <file1,file2,...>")
+        print("  quit")
+        print("="*60 + "\n")
+        
+        # Command loop
+        while True:
+            try:
+                cmd = input("hydfs> ").strip()
+                if not cmd:
+                    continue
+                
+                parts = cmd.split()
+                command = parts[0].lower()
+                
+                if command == 'quit' or command == 'exit':
+                    break
+                
+                # Execute command directly in interactive mode
+                result = execute_command(client, cmd)
+                print(result, end='')
+            
+            except KeyboardInterrupt:
+                print("\nExiting...")
+                break
+            except Exception as e:
+                print(f"Error: {e}")
+                import traceback
+                traceback.print_exc()
     
     # Cleanup
     print("\nLeaving group...")
