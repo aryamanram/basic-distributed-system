@@ -1,11 +1,12 @@
 """
-HyDFS Node - Core implementation
+HyDFS Node - Core implementation with Control Server
 """
 import os
 import sys
 import socket
 import time
 import threading
+import json
 from typing import List, Optional, Dict, Any
 
 # Add parent directory to path for imports
@@ -20,15 +21,17 @@ from replication import ReplicationManager, REPLICATION_FACTOR
 from utils import Logger, get_node_id, get_file_id
 
 HYDFS_PORT = 7000
+CONTROL_PORT = 9090
 
 class HyDFSNode:
     """
-    Main HyDFS node that integrates all components.
+    Main HyDFS node that integrates all components with control server.
     """
     def __init__(self, vm_id: int):
         self.vm_id = vm_id
         self.hostname = socket.gethostname()
         self.port = HYDFS_PORT
+        self.control_port = CONTROL_PORT
         
         # Generate node ID with timestamp
         self.node_id = get_node_id(self.hostname, self.port)
@@ -61,6 +64,12 @@ class HyDFSNode:
         # Track active nodes
         self.active_nodes_lock = threading.Lock()
         
+        # Running flag
+        self.running = False
+        
+        # Control thread
+        self.control_thread: Optional[threading.Thread] = None
+        
         self.logger.log(f"INIT: HyDFS Node {vm_id} initialized")
         self.logger.log(f"INIT: Node ID: {self.node_id}")
         self.logger.log(f"INIT: Ring position: {self.ring.get_node_position(self.node_id)}")
@@ -69,6 +78,8 @@ class HyDFSNode:
         """
         Start the HyDFS node.
         """
+        self.running = True
+        
         # Start network server
         self.network.start()
         
@@ -77,6 +88,9 @@ class HyDFSNode:
         
         # Start replication monitoring
         self.replication.start_monitoring()
+        
+        # Start control server
+        self.start_control_server()
         
         # Monitor membership changes
         threading.Thread(target=self._monitor_membership, daemon=True).start()
@@ -87,10 +101,170 @@ class HyDFSNode:
         """
         Stop the HyDFS node.
         """
+        self.running = False
         self.replication.stop_monitoring()
         self.network.stop()
         self.membership.stop()
         self.logger.log("NODE: Stopped")
+    
+    def start_control_server(self):
+        """
+        Start the control server for receiving commands from controller.
+        """
+        self.control_thread = threading.Thread(target=self._control_loop, daemon=True)
+        self.control_thread.start()
+        self.logger.log(f"CONTROL: Listening on port {self.control_port}")
+    
+    def _control_loop(self):
+        """
+        Control server loop for receiving commands from controller.
+        """
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("", self.control_port))
+        srv.listen(8)
+        
+        while self.running:
+            try:
+                conn, addr = srv.accept()
+                
+                # Receive command
+                size_header = conn.recv(10)
+                if not size_header:
+                    conn.close()
+                    continue
+                
+                size = int(size_header.decode('utf-8'))
+                command_data = b''
+                while len(command_data) < size:
+                    chunk = conn.recv(min(4096, size - len(command_data)))
+                    if not chunk:
+                        break
+                    command_data += chunk
+                
+                command = json.loads(command_data.decode('utf-8'))
+                
+                # Handle command (don't log to avoid clutter)
+                response = self._handle_control_command(command)
+                
+                # Send response
+                response_data = json.dumps(response).encode('utf-8')
+                size_header = f"{len(response_data):010d}".encode('utf-8')
+                conn.sendall(size_header + response_data)
+                
+                conn.close()
+            except Exception as e:
+                if self.running:
+                    self.logger.log(f"CONTROL ERROR: {e}")
+    
+    def _handle_control_command(self, command: dict) -> dict:
+        """
+        Handle a command from the controller.
+        """
+        try:
+            cmd_type = command.get('type')
+            
+            # Handle special controller commands
+            if cmd_type == 'APPEND':
+                # Controller-based append with client generation
+                filename = command.get('filename')
+                data = bytes(command.get('data', []))
+                
+                # Generate client ID
+                client_id = f"{self.hostname}_{os.getpid()}_{time.time()}"
+                
+                # Get sequence number
+                seq_num = self.consistency.get_next_sequence(client_id)
+                
+                # Create block
+                block_id = f"{get_file_id(filename)}_{client_id}_{seq_num}"
+                block = FileBlock(
+                    block_id=block_id,
+                    client_id=client_id,
+                    sequence_num=seq_num,
+                    timestamp=time.time(),
+                    data=data,
+                    size=len(data)
+                )
+                
+                # Get replicas
+                replicas = self.get_replicas_for_file(filename)
+                
+                # Send to all replicas
+                success_count = 0
+                for node_id in replicas:
+                    try:
+                        hostname = node_id.split(':')[0]
+                        port = int(node_id.split(':')[1])
+                        
+                        msg = {
+                            'type': 'APPEND',
+                            'filename': filename,
+                            'client_id': client_id,
+                            'block': {
+                                'block_id': block.block_id,
+                                'client_id': block.client_id,
+                                'sequence_num': block.sequence_num,
+                                'timestamp': block.timestamp,
+                                'data': list(block.data),
+                                'size': block.size
+                            }
+                        }
+                        
+                        response = self.network.send_message(hostname, port, msg)
+                        if response and response.get('status') == 'success':
+                            success_count += 1
+                    except:
+                        pass
+                
+                return {
+                    'status': 'success',
+                    'message': f'Appended to {success_count}/{len(replicas)} replicas'
+                }
+            
+            elif cmd_type == 'CREATE':
+                # Controller-based create
+                filename = command.get('filename')
+                data = bytes(command.get('data', []))
+                
+                # Get replicas
+                replicas = self.get_replicas_for_file(filename)
+                
+                # Send to all replicas
+                success_count = 0
+                msg = {
+                    'type': 'CREATE',
+                    'filename': filename,
+                    'data': list(data)
+                }
+                
+                for node_id in replicas:
+                    try:
+                        hostname = node_id.split(':')[0]
+                        port = int(node_id.split(':')[1])
+                        
+                        response = self.network.send_message(hostname, port, msg)
+                        if response and response.get('status') == 'success':
+                            success_count += 1
+                    except:
+                        pass
+                
+                return {
+                    'status': 'success',
+                    'message': f'Created on {success_count}/{len(replicas)} replicas'
+                }
+            
+            # Delegate to existing handlers
+            elif cmd_type in self.network.handlers:
+                # Create a fake address tuple
+                response = self.network.handlers[cmd_type](command, ('controller', 0))
+                return response
+            
+            return {'status': 'error', 'message': f'Unknown command type: {cmd_type}'}
+        
+        except Exception as e:
+            import traceback
+            return {'status': 'error', 'message': f'{str(e)}\n{traceback.format_exc()}'}
     
     def _monitor_membership(self):
         """
@@ -98,7 +272,7 @@ class HyDFSNode:
         """
         known_members = set()
         
-        while True:
+        while self.running:
             try:
                 time.sleep(2.0)
                 
@@ -161,15 +335,11 @@ class HyDFSNode:
         """
         Handle CREATE request.
         """
-        self.logger.log(f"OPERATION: Received CREATE request")
-        
         filename = message.get('filename')
         data = bytes(message.get('data', []))
         
         # Create file locally
         success, msg = self.storage.create_file(filename, data)
-        
-        self.logger.log(f"OPERATION: CREATE {filename} completed - {msg}")
         
         return {'status': 'success' if success else 'error', 'message': msg}
     
@@ -177,8 +347,6 @@ class HyDFSNode:
         """
         Handle GET request.
         """
-        self.logger.log(f"OPERATION: Received GET request")
-        
         filename = message.get('filename')
         client_id = message.get('client_id', 'unknown')
         
@@ -193,10 +361,7 @@ class HyDFSNode:
         data = self.storage.get_file_data(filename)
         
         if data is None:
-            self.logger.log(f"OPERATION: GET {filename} completed - File not found")
             return {'status': 'error', 'message': 'File not found'}
-        
-        self.logger.log(f"OPERATION: GET {filename} completed - {len(data)} bytes")
         
         return {
             'status': 'success',
@@ -208,8 +373,6 @@ class HyDFSNode:
         """
         Handle APPEND request.
         """
-        self.logger.log(f"OPERATION: Received APPEND request")
-        
         filename = message.get('filename')
         client_id = message.get('client_id')
         block_data = message.get('block')
@@ -227,16 +390,12 @@ class HyDFSNode:
         # Append block
         success, msg = self.storage.append_block(filename, block)
         
-        self.logger.log(f"OPERATION: APPEND {filename} completed - {msg}")
-        
         return {'status': 'success' if success else 'error', 'message': msg}
     
     def _handle_merge(self, message: dict, addr: tuple) -> dict:
         """
         Handle MERGE request.
         """
-        self.logger.log(f"OPERATION: Received MERGE request")
-        
         filename = message.get('filename')
         
         # Check if merge already in progress
@@ -322,7 +481,6 @@ class HyDFSNode:
                 except Exception as e:
                     self.logger.log(f"MERGE ERROR: Update {node_id}: {e}")
             
-            self.logger.log(f"OPERATION: MERGE {filename} completed")
             return {'status': 'success', 'message': 'Merge completed'}
         
         finally:
