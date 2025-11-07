@@ -1,6 +1,7 @@
 """
 HyDFS Controller - Control interface for managing HyDFS operations across VMs
 Similar to MP2's command_functions.py
+Enhanced with multi-VM selection support
 """
 import socket
 import json
@@ -55,8 +56,9 @@ def print_help():
     print("HyDFS Controller Commands")
     print("="*70)
     print("\nVM Selection:")
-    print("  vm <id>          - Select VM (1-10)")
-    print("  vm all           - Select all VMs")
+    print("  vm <id>              - Select single VM (1-10)")
+    print("  vm <id1,id2,...>     - Select multiple VMs (e.g., vm 1,2,5,8)")
+    print("  vm all               - Select all VMs")
     print("\nFile Operations:")
     print("  create <local> <hydfs>")
     print("  get <hydfs> <local>")
@@ -147,6 +149,10 @@ def main():
     print("="*70)
     print("\nType 'help' for available commands")
     print("Type 'status' to check VM connectivity")
+    print("\nVM Selection Examples:")
+    print("  vm 1         - Select VM 1")
+    print("  vm 1,2,5,8   - Select VMs 1, 2, 5, and 8")
+    print("  vm all       - Select all VMs")
     print("="*70 + "\n")
     
     target = None
@@ -164,15 +170,31 @@ def main():
                     target = "all"
                     print(f"Target set to: all VMs")
                 else:
-                    try:
-                        vm_id = int(arg)
-                        if 1 <= vm_id <= 10:
-                            target = vm_id
-                            print(f"Target set to: VM{vm_id} ({VM_HOSTS[vm_id]})")
-                        else:
-                            print("Error: VM ID must be between 1 and 10")
-                    except ValueError:
-                        print("Error: Invalid VM ID")
+                    # Check if comma-separated list
+                    if ',' in arg:
+                        try:
+                            vm_ids = [int(x.strip()) for x in arg.split(',')]
+                            # Validate all IDs
+                            invalid = [vid for vid in vm_ids if vid < 1 or vid > 10]
+                            if invalid:
+                                print(f"Error: Invalid VM IDs: {invalid}. Must be between 1 and 10")
+                            else:
+                                target = vm_ids
+                                vm_list = ', '.join([f"VM{vid}" for vid in vm_ids])
+                                print(f"Target set to: {vm_list}")
+                        except ValueError:
+                            print("Error: Invalid VM ID format. Use comma-separated numbers (e.g., 1,2,5)")
+                    else:
+                        # Single VM
+                        try:
+                            vm_id = int(arg)
+                            if 1 <= vm_id <= 10:
+                                target = vm_id
+                                print(f"Target set to: VM{vm_id} ({VM_HOSTS[vm_id]})")
+                            else:
+                                print("Error: VM ID must be between 1 and 10")
+                        except ValueError:
+                            print("Error: Invalid VM ID")
                 continue
             
             # Handle special commands
@@ -190,7 +212,7 @@ def main():
             
             # Validate target is set
             if target is None:
-                print("Error: No target VM selected. Use 'vm <id>' or 'vm all'")
+                print("Error: No target VM selected. Use 'vm <id>', 'vm <id1,id2,...>', or 'vm all'")
                 continue
             
             # Parse and validate command
@@ -206,7 +228,15 @@ def main():
                 for vm_id in range(1, 11):
                     send_command(vm_id, cmd_str)
                 print("=" * 60)
+            elif isinstance(target, list):
+                # Multiple specific VMs
+                print(f"\nExecuting '{cmd_str}' on VMs: {', '.join(map(str, target))}...")
+                print("=" * 60)
+                for vm_id in target:
+                    send_command(vm_id, cmd_str)
+                print("=" * 60)
             else:
+                # Single VM
                 send_command(target, cmd_str)
         
         except KeyboardInterrupt:
