@@ -30,17 +30,21 @@ class HyDFSNode:
         self.hostname = socket.gethostname()
         self.port = HYDFS_PORT
         
-        # Generate node ID with timestamp
-        self.node_id = get_node_id(self.hostname, self.port)
-        
         # Initialize logger
         self.logger = Logger(vm_id)
+        
+        # Initialize MP2 membership FIRST to get consistent member_id
+        self.membership = MembershipService(vm_id)
+        
+        # Use MP2's integer timestamp for node_id (matches _monitor_membership format)
+        mp2_timestamp = self.membership.member_id.split('_')[0]
+        self.node_id = f"{self.hostname}:{self.port}:{mp2_timestamp}"
         
         # Initialize storage
         storage_dir = f"hydfs_storage_{vm_id}"
         self.storage = FileStorage(storage_dir)
         
-        # Initialize ring
+        # Initialize ring with consistent node_id
         self.ring = ConsistentHashRing()
         self.ring.add_node(self.node_id)
         
@@ -54,9 +58,6 @@ class HyDFSNode:
         
         # Initialize replication manager
         self.replication = ReplicationManager(self, self.logger)
-        
-        # Initialize MP2 membership (for failure detection)
-        self.membership = MembershipService(vm_id)
         
         # Track active nodes
         self.active_nodes_lock = threading.Lock()
