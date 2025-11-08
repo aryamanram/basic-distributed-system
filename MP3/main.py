@@ -195,6 +195,8 @@ class HyDFSClient:
             
             for node_id in replicas:
                 try:
+                    if success_count > 0:
+                        break
                     hostname = node_id.split(':')[0]
                     port = int(node_id.split(':')[1])
                     
