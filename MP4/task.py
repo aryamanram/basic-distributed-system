@@ -1,689 +1,612 @@
+#!/usr/bin/env python3
 """
-RainStorm Task Execution
-- Source task (read from HyDFS/local, throttle INPUT_RATE)
-- Processing task (invoke op_exe via subprocess)
-- Sink behavior (write to HyDFS + console)
-- Tuple partitioning to downstream tasks
-- Task logging (tuples, duplicates)
+RainStorm Task - Individual task process that runs an operator
+Handles tuple processing, exactly-once semantics, and rate reporting
 """
-import os
-import sys
-import time
-import subprocess
-import threading
-import signal
+import argparse
 import json
-from typing import Dict, List, Optional, Callable, Tuple
-from utils import (
-    StreamTuple, RainStormLogger, load_config, get_vm_by_id,
-    make_task_id, get_task_port, parse_csv_line, serialize_message,
-    deserialize_message, send_sized_message, recv_sized_message
-)
-from network import TupleChannel, RPCServer, RPCClient
-from exactly_once import ExactlyOnceManager
-from autoscale import RateMonitor, InputRateController, PartitionManager
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+from typing import Dict, List, Optional, Set
 
-# Add parent for MP3
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
-# ============================================================================
-# Base Task
-# ============================================================================
+from MP3.node import HyDFSNode
+from MP3.main import HyDFSClient
 
-class Task:
-    """
-    Base class for RainStorm tasks.
-    """
-    def __init__(self, task_id: str, stage_num: int, vm_id: int,
-                 port: int, exactly_once: bool, run_id: str):
+RAINSTORM_PORT = 8000
+TASK_BASE_PORT = 8100
+
+
+def get_timestamp() -> str:
+    """Get formatted timestamp."""
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+
+
+class TaskLogger:
+    """Logger for task operations."""
+    
+    def __init__(self, task_id: str, run_id: str, vm_id: int):
         self.task_id = task_id
-        self.stage_num = stage_num
+        self.log_file = f"task_{task_id}_{run_id}.log"
         self.vm_id = vm_id
-        self.port = port
-        self.run_id = run_id
-        
-        # Logger (new file per invocation)
-        self.logger = RainStormLogger(f"task_{task_id}", vm_id, run_id)
-        
-        # Network
-        self.tuple_channel = TupleChannel(task_id, self.logger)
-        self.rpc_server = RPCServer(port, self.logger)
-        self.rpc_client = RPCClient(self.logger)
-        
-        # Exactly-once
-        hydfs_state_file = f"rainstorm_state_{task_id}.log"
-        self.eo_manager = ExactlyOnceManager(
-            task_id, hydfs_state_file, self.logger, enabled=exactly_once
-        )
-        
-        # Rate monitoring
-        self.rate_monitor = RateMonitor(task_id, self.logger)
-        
-        # Downstream routing
-        self.downstream_tasks: List[Tuple[str, str, int]] = []  # (task_id, host, port)
-        
-        # Control
-        self.running = False
-        self.processed_count = 0
-        self.output_count = 0
-        
-        # Register RPC handlers
-        self._register_handlers()
+        self.lock = threading.Lock()
     
-    def _register_handlers(self):
-        """Register RPC handlers."""
-        self.rpc_server.register_handler('ROUTING_UPDATE', self._handle_routing_update)
-        self.rpc_server.register_handler('STOP', self._handle_stop)
-        self.rpc_server.register_handler('STATUS', self._handle_status)
+    def log(self, msg: str):
+        """Log a message with timestamp."""
+        line = f"[{get_timestamp()}] [{self.task_id}] {msg}"
+        with self.lock:
+            print(line)
+            with open(self.log_file, 'a') as f:
+                f.write(line + "\n")
+
+
+class ExactlyOnceTracker:
+    """
+    Tracks processed tuples for exactly-once semantics.
+    Uses HyDFS for persistence.
+    """
     
-    def _handle_routing_update(self, message: Dict, addr: Tuple) -> Dict:
-        """Handle routing table update from leader."""
-        downstream = message.get('downstream', [])
-        self.downstream_tasks = [(t['task_id'], t['host'], t['port']) for t in downstream]
+    def __init__(self, task_id: str, hydfs_client: HyDFSClient, logger: TaskLogger):
+        self.task_id = task_id
+        self.hydfs_client = hydfs_client
+        self.logger = logger
         
-        # Update tuple channel
-        for task_id, host, port in self.downstream_tasks:
-            self.tuple_channel.add_downstream(task_id, host, port)
+        self.processed_ids: Set[str] = set()
+        self.acked_outputs: Set[str] = set()
+        self.lock = threading.Lock()
         
-        self.logger.log(f"Routing updated: {len(self.downstream_tasks)} downstream tasks")
-        return {'status': 'ok'}
+        self.hydfs_log_file = f"rainstorm_log_{task_id}.log"
+        self.local_log_file = f"eo_log_{task_id}.log"
+        
+        # Batch for efficiency
+        self.pending_log_entries: List[str] = []
+        self.batch_size = 10
+        
+        # Load existing state
+        self._load_state()
     
-    def _handle_stop(self, message: Dict, addr: Tuple) -> Dict:
-        """Handle stop command."""
-        self.stop()
-        return {'status': 'ok'}
+    def _load_state(self):
+        """Load state from HyDFS log file."""
+        try:
+            # Merge first
+            self.hydfs_client.merge(self.hydfs_log_file)
+            
+            # Get log file
+            temp_file = f"/tmp/{self.hydfs_log_file}"
+            self.hydfs_client.get(self.hydfs_log_file, temp_file)
+            
+            if os.path.exists(temp_file):
+                with open(temp_file, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith('PROCESSED:'):
+                            tuple_id = line[10:]
+                            self.processed_ids.add(tuple_id)
+                        elif line.startswith('ACK:'):
+                            output_id = line[4:]
+                            self.acked_outputs.add(output_id)
+                
+                self.logger.log(f"EO: Loaded {len(self.processed_ids)} processed, "
+                              f"{len(self.acked_outputs)} acked")
+        except Exception as e:
+            self.logger.log(f"EO: No existing log (new task): {e}")
     
-    def _handle_status(self, message: Dict, addr: Tuple) -> Dict:
-        """Handle status query."""
-        return {
-            'status': 'ok',
-            'task_id': self.task_id,
-            'stage': self.stage_num,
-            'running': self.running,
-            'processed': self.processed_count,
-            'output': self.output_count,
-            'rate': self.rate_monitor.get_rate()
-        }
-    
-    def set_downstream(self, tasks: List[Tuple[str, str, int]]):
-        """Set downstream tasks."""
-        self.downstream_tasks = tasks
-        for task_id, host, port in tasks:
-            self.tuple_channel.add_downstream(task_id, host, port)
-    
-    def send_downstream(self, tuple_data: StreamTuple) -> bool:
-        """Send tuple to appropriate downstream task based on key."""
-        if not self.downstream_tasks:
+    def is_duplicate(self, tuple_id: str) -> bool:
+        """Check if a tuple has already been processed."""
+        with self.lock:
+            if tuple_id in self.processed_ids:
+                self.logger.log(f"DUPLICATE REJECTED: {tuple_id}")
+                return True
             return False
+    
+    def mark_processed(self, tuple_id: str):
+        """Mark a tuple as processed."""
+        with self.lock:
+            self.processed_ids.add(tuple_id)
+            self.pending_log_entries.append(f"PROCESSED:{tuple_id}")
+            
+            if len(self.pending_log_entries) >= self.batch_size:
+                self._flush_to_hydfs()
+    
+    def mark_output_acked(self, output_id: str):
+        """Mark an output as acknowledged by next stage."""
+        with self.lock:
+            self.acked_outputs.add(output_id)
+            self.pending_log_entries.append(f"ACK:{output_id}")
+            
+            if len(self.pending_log_entries) >= self.batch_size:
+                self._flush_to_hydfs()
+    
+    def is_output_acked(self, output_id: str) -> bool:
+        """Check if an output has been acknowledged."""
+        with self.lock:
+            return output_id in self.acked_outputs
+    
+    def _flush_to_hydfs(self):
+        """Flush pending log entries to HyDFS."""
+        if not self.pending_log_entries:
+            return
         
-        # Partition by key
-        from utils import hash_partition
-        partition = hash_partition(tuple_data.key, len(self.downstream_tasks))
-        target_task_id, target_host, target_port = self.downstream_tasks[partition]
+        try:
+            # Write to local file first
+            with open(self.local_log_file, 'a') as f:
+                for entry in self.pending_log_entries:
+                    f.write(entry + "\n")
+            
+            # Append to HyDFS
+            temp_file = f"/tmp/eo_batch_{self.task_id}_{time.time()}.log"
+            with open(temp_file, 'w') as f:
+                for entry in self.pending_log_entries:
+                    f.write(entry + "\n")
+            
+            self.hydfs_client.append(temp_file, self.hydfs_log_file)
+            
+            self.pending_log_entries.clear()
+        except Exception as e:
+            self.logger.log(f"EO: Flush error: {e}")
+    
+    def flush(self):
+        """Force flush pending entries."""
+        with self.lock:
+            self._flush_to_hydfs()
+
+
+class RainStormTask:
+    """
+    Individual RainStorm task process.
+    Receives tuples, processes them with operator, and forwards to next stage.
+    """
+    
+    def __init__(self, task_id: str, stage: int, task_idx: int, port: int,
+                 op_exe: str, op_args: str, leader_host: str, run_id: str,
+                 vm_id: int, exactly_once: bool):
+        self.task_id = task_id
+        self.stage = stage
+        self.task_idx = task_idx
+        self.port = port
+        self.op_exe = op_exe
+        self.op_args = op_args
+        self.leader_host = leader_host
+        self.run_id = run_id
+        self.vm_id = vm_id
+        self.exactly_once = exactly_once
         
-        # Assign output tuple ID
-        tuple_data.tuple_id = self.eo_manager.generate_output_id()
-        tuple_data.source_task = self.task_id
+        self.logger = TaskLogger(task_id, run_id, vm_id)
         
-        # Send
-        success = self.tuple_channel.send_tuple(
-            tuple_data, target_task_id, 
-            wait_ack=self.eo_manager.enabled
-        )
+        self.running = False
+        self.server_socket: Optional[socket.socket] = None
         
-        if success:
-            self.eo_manager.on_output_sent(tuple_data)
-            self.output_count += 1
-            self.logger.log_tuple(tuple_data, "OUT")
+        # HyDFS for exactly-once
+        self.hydfs_node: Optional[HyDFSNode] = None
+        self.hydfs_client: Optional[HyDFSClient] = None
+        self.eo_tracker: Optional[ExactlyOnceTracker] = None
         
-        return success
+        # Task configuration from leader
+        self.config: Optional[dict] = None
+        self.successor_tasks: List[dict] = []
+        self.hydfs_dest: str = ''
+        self.num_stages: int = 0
+        
+        # Rate tracking
+        self.tuples_processed = 0
+        self.last_rate_time = time.time()
+        self.last_tuple_count = 0
+        
+        # Pending outputs for retry
+        self.pending_outputs: Dict[str, dict] = {}  # output_id -> {tuple, target, retries}
+        self.pending_lock = threading.Lock()
+        
+        # EOF tracking
+        self.eof_received = 0
+        self.expected_eof = 0
     
     def start(self):
         """Start the task."""
         self.running = True
         
-        # Start RPC server
-        self.rpc_server.start()
+        self.logger.log(f"TASK START: stage={self.stage} idx={self.task_idx} "
+                       f"op={self.op_exe} args={self.op_args}")
         
-        # Start tuple receiver
-        tuple_port = self.port + 1000  # Separate port for tuples
-        self.tuple_channel.start_receiver(tuple_port)
+        # Initialize HyDFS if exactly-once
+        if self.exactly_once:
+            self.hydfs_node = HyDFSNode(self.vm_id)
+            self.hydfs_node.start()
+            self.hydfs_node.membership.join_group()
+            time.sleep(1)
+            
+            self.hydfs_client = HyDFSClient(self.hydfs_node)
+            self.eo_tracker = ExactlyOnceTracker(self.task_id, self.hydfs_client, self.logger)
         
-        # Start rate reporting
-        self.rate_monitor.start_reporting(self._report_rate)
+        # Get configuration from leader
+        self._get_config_from_leader()
         
-        # Recover state if exactly-once
-        if self.eo_manager.enabled:
-            unacked = self.eo_manager.recover_state()
-            if unacked:
-                self.logger.log(f"Resending {len(unacked)} unacked tuples")
-                for t in unacked:
-                    self.send_downstream(t)
+        # Start server to receive tuples
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind(('', self.port))
+        self.server_socket.listen(20)
         
-        self.logger.log_event("TASK_START", {
-            'task_id': self.task_id,
-            'stage': self.stage_num,
-            'vm': self.vm_id,
-            'pid': os.getpid(),
-            'port': self.port
-        })
+        # Notify leader
+        self._notify_leader_started()
+        
+        # Start rate reporting thread
+        threading.Thread(target=self._rate_report_loop, daemon=True).start()
+        
+        # Start retry thread for exactly-once
+        if self.exactly_once:
+            threading.Thread(target=self._retry_loop, daemon=True).start()
+        
+        # Main loop
+        self._server_loop()
     
     def stop(self):
         """Stop the task."""
         self.running = False
         
-        # Flush state
-        self.eo_manager.flush_state()
+        if self.eo_tracker:
+            self.eo_tracker.flush()
         
-        # Stop components
-        self.rate_monitor.stop_reporting()
-        self.tuple_channel.stop_receiver()
-        self.rpc_server.stop()
+        if self.server_socket:
+            self.server_socket.close()
         
-        self.logger.log_event("TASK_STOP", {
-            'task_id': self.task_id,
-            'processed': self.processed_count,
-            'output': self.output_count
-        })
+        if self.hydfs_node:
+            self.hydfs_node.membership.leave_group()
+            self.hydfs_node.stop()
+        
+        self._notify_leader_completed()
+        
+        self.logger.log("TASK END")
     
-    def _report_rate(self, task_id: str, rate: float):
-        """Report rate to leader (placeholder - actual impl in subclass)."""
-        pass
-    
-    def run(self):
-        """Main task loop - override in subclasses."""
-        raise NotImplementedError
-
-# ============================================================================
-# Source Task
-# ============================================================================
-
-class SourceTask(Task):
-    """
-    Source task that reads from input file and produces tuples.
-    """
-    def __init__(self, task_id: str, vm_id: int, port: int,
-                 input_file: str, input_rate: float, 
-                 exactly_once: bool, run_id: str,
-                 use_local_file: bool = True):
-        super().__init__(task_id, 0, vm_id, port, exactly_once, run_id)
-        
-        self.input_file = input_file
-        self.input_rate = input_rate
-        self.use_local_file = use_local_file
-        
-        # Rate controller
-        self.rate_controller = InputRateController(input_rate, self.logger)
-        
-        # Line tracking
-        self.current_line = 0
-        self.total_lines = 0
-    
-    def run(self):
-        """Read input file and emit tuples."""
-        self.start()
-        self.logger.log(f"Source starting: file={self.input_file}, rate={self.input_rate}")
-        
+    def _get_config_from_leader(self):
+        """Get task configuration from leader."""
         try:
-            # Open input file
-            if self.use_local_file:
-                file_handle = open(self.input_file, 'r')
-            else:
-                # Read from HyDFS - simplified for now
-                file_handle = self._open_hydfs_file()
+            msg = {'type': 'GET_TASK_CONFIG', 'task_id': self.task_id}
+            response = self._send_to_leader(msg)
             
-            if not file_handle:
-                self.logger.log("Failed to open input file")
-                return
-            
-            # Read and emit lines
-            for line in file_handle:
-                if not self.running:
-                    break
+            if response and response.get('status') == 'success':
+                self.config = response
+                self.successor_tasks = response.get('successor_tasks', [])
+                self.hydfs_dest = response.get('hydfs_dest', '')
+                self.num_stages = response.get('num_stages', 1)
                 
-                self.current_line += 1
-                line = line.strip()
-                
-                if not line:
-                    continue
-                
-                # Create tuple: key = filename:linenum, value = line
-                key = f"{self.input_file}:{self.current_line}"
-                tuple_data = StreamTuple(key=key, value=line)
-                
-                # Rate control
-                self.rate_controller.wait_for_next()
-                
-                # Send to stage 1
-                success = self.send_downstream(tuple_data)
-                if success:
-                    self.rate_controller.record_emit()
-                    self.processed_count += 1
-                    self.rate_monitor.record_tuple()
-            
-            file_handle.close()
-            self.total_lines = self.current_line
-            
-            self.logger.log(f"Source completed: {self.total_lines} lines processed")
-            
-            # Wait for all acks if exactly-once
-            if self.eo_manager.enabled:
-                self._wait_for_acks()
-        
+                self.logger.log(f"CONFIG: successors={len(self.successor_tasks)} "
+                              f"dest={self.hydfs_dest}")
         except Exception as e:
-            self.logger.log(f"Source error: {e}")
-        finally:
-            self.stop()
+            self.logger.log(f"CONFIG ERROR: {e}")
     
-    def _open_hydfs_file(self):
-        """Open file from HyDFS."""
+    def _notify_leader_started(self):
+        """Notify leader that task has started."""
+        msg = {
+            'type': 'TASK_STARTED',
+            'task_id': self.task_id,
+            'pid': os.getpid(),
+            'log_file': self.logger.log_file
+        }
+        self._send_to_leader(msg)
+    
+    def _notify_leader_completed(self):
+        """Notify leader that task has completed."""
+        msg = {'type': 'TASK_COMPLETED', 'task_id': self.task_id}
+        self._send_to_leader(msg)
+    
+    def _send_to_leader(self, msg: dict) -> Optional[dict]:
+        """Send message to leader."""
         try:
-            # Would use HyDFS client here
-            # For now, fall back to local
-            return open(self.input_file, 'r')
-        except:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10.0)
+            sock.connect((self.leader_host, RAINSTORM_PORT))
+            sock.sendall(json.dumps(msg).encode('utf-8'))
+            response = sock.recv(65536).decode('utf-8')
+            sock.close()
+            return json.loads(response)
+        except Exception as e:
+            self.logger.log(f"LEADER COMM ERROR: {e}")
             return None
     
-    def _wait_for_acks(self, timeout: float = 30.0):
-        """Wait for all output acks."""
-        start = time.time()
-        while time.time() - start < timeout:
-            if not self.tuple_channel.has_pending_acks():
-                break
-            time.sleep(0.5)
-
-# ============================================================================
-# Processing Task
-# ============================================================================
-
-class ProcessingTask(Task):
-    """
-    Processing task that applies an operator to tuples.
-    """
-    def __init__(self, task_id: str, stage_num: int, vm_id: int,
-                 port: int, op_exe: str, op_args: str,
-                 exactly_once: bool, run_id: str,
-                 is_stateful: bool = False):
-        super().__init__(task_id, stage_num, vm_id, port, exactly_once, run_id)
-        
-        self.op_exe = op_exe
-        self.op_args = op_args
-        self.is_stateful = is_stateful
-        
-        # Operator state (for aggregation)
-        self.state: Dict = {}
-    
-    def run(self):
-        """Process incoming tuples."""
-        self.start()
-        self.logger.log(f"Processing task starting: op={self.op_exe}, args={self.op_args}")
-        
-        try:
-            while self.running:
-                # Receive tuple
-                tuple_data = self.tuple_channel.receive_tuple(timeout=1.0)
-                
-                if tuple_data is None:
-                    continue
-                
-                # Check for duplicate
-                if not self.eo_manager.should_process(tuple_data):
-                    continue
-                
-                # Process tuple
-                output_tuples = self._process_tuple(tuple_data)
-                
-                # Mark as processed
-                self.eo_manager.on_tuple_processed(tuple_data)
-                self.processed_count += 1
-                self.rate_monitor.record_tuple()
-                
-                # Send outputs downstream
-                for out_tuple in output_tuples:
-                    self.send_downstream(out_tuple)
-        
-        except Exception as e:
-            self.logger.log(f"Processing error: {e}")
-        finally:
-            self.stop()
-    
-    def _process_tuple(self, tuple_data: StreamTuple) -> List[StreamTuple]:
-        """
-        Process a tuple using the operator.
-        Returns list of output tuples (may be empty for filter, or multiple).
-        """
-        try:
-            # Run operator as subprocess
-            result = subprocess.run(
-                [self.op_exe] + self.op_args.split(),
-                input=f"{tuple_data.key}\t{tuple_data.value}\n",
-                capture_output=True,
-                text=True,
-                timeout=10.0
-            )
-            
-            output_tuples = []
-            
-            if result.stdout:
-                for line in result.stdout.strip().split('\n'):
-                    if not line:
-                        continue
-                    
-                    # Parse output: key\tvalue
-                    parts = line.split('\t', 1)
-                    if len(parts) == 2:
-                        out_tuple = StreamTuple(key=parts[0], value=parts[1])
-                        output_tuples.append(out_tuple)
-                    elif len(parts) == 1:
-                        # Just value, use original key
-                        out_tuple = StreamTuple(key=tuple_data.key, value=parts[0])
-                        output_tuples.append(out_tuple)
-            
-            return output_tuples
-        
-        except subprocess.TimeoutExpired:
-            self.logger.log(f"Operator timeout for tuple {tuple_data.tuple_id}")
-            return []
-        except Exception as e:
-            self.logger.log(f"Operator error: {e}")
-            return []
-
-# ============================================================================
-# Sink Task (Final Stage)
-# ============================================================================
-
-class SinkTask(Task):
-    """
-    Sink task that writes output to HyDFS and console.
-    """
-    def __init__(self, task_id: str, stage_num: int, vm_id: int,
-                 port: int, op_exe: str, op_args: str,
-                 output_file: str, exactly_once: bool, run_id: str,
-                 is_stateful: bool = False):
-        super().__init__(task_id, stage_num, vm_id, port, exactly_once, run_id)
-        
-        self.op_exe = op_exe
-        self.op_args = op_args
-        self.output_file = output_file
-        self.is_stateful = is_stateful
-        
-        # State for aggregation
-        self.state: Dict = {}
-        
-        # Local output buffer
-        self.output_buffer: List[str] = []
-        self.buffer_lock = threading.Lock()
-        self.flush_interval = 1.0  # seconds
-    
-    def run(self):
-        """Process tuples and write to output."""
-        self.start()
-        self.logger.log(f"Sink starting: op={self.op_exe}, output={self.output_file}")
-        
-        # Start periodic flush thread
-        flush_thread = threading.Thread(target=self._flush_loop, daemon=True)
-        flush_thread.start()
-        
-        try:
-            while self.running:
-                # Receive tuple
-                tuple_data = self.tuple_channel.receive_tuple(timeout=1.0)
-                
-                if tuple_data is None:
-                    continue
-                
-                # Check for duplicate
-                if not self.eo_manager.should_process(tuple_data):
-                    continue
-                
-                # Process tuple
-                output_tuples = self._process_tuple(tuple_data)
-                
-                # Mark as processed
-                self.eo_manager.on_tuple_processed(tuple_data)
-                self.processed_count += 1
-                self.rate_monitor.record_tuple()
-                
-                # Output results
-                for out_tuple in output_tuples:
-                    self._output_tuple(out_tuple)
-        
-        except Exception as e:
-            self.logger.log(f"Sink error: {e}")
-        finally:
-            # Final flush
-            self._flush_output()
-            self.stop()
-    
-    def _process_tuple(self, tuple_data: StreamTuple) -> List[StreamTuple]:
-        """Process tuple using operator."""
-        try:
-            result = subprocess.run(
-                [self.op_exe] + self.op_args.split(),
-                input=f"{tuple_data.key}\t{tuple_data.value}\n",
-                capture_output=True,
-                text=True,
-                timeout=10.0
-            )
-            
-            output_tuples = []
-            
-            if result.stdout:
-                for line in result.stdout.strip().split('\n'):
-                    if not line:
-                        continue
-                    
-                    parts = line.split('\t', 1)
-                    if len(parts) == 2:
-                        out_tuple = StreamTuple(key=parts[0], value=parts[1])
-                        output_tuples.append(out_tuple)
-                    elif len(parts) == 1:
-                        out_tuple = StreamTuple(key=tuple_data.key, value=parts[0])
-                        output_tuples.append(out_tuple)
-            
-            return output_tuples
-        
-        except Exception as e:
-            self.logger.log(f"Operator error: {e}")
-            return []
-    
-    def _output_tuple(self, tuple_data: StreamTuple):
-        """Output a tuple to console and buffer for HyDFS."""
-        output_line = f"{tuple_data.key}\t{tuple_data.value}"
-        
-        # Console output
-        print(f"[OUTPUT] {output_line}")
-        
-        # Buffer for file
-        with self.buffer_lock:
-            self.output_buffer.append(output_line)
-        
-        # Log
-        self.logger.log_tuple(tuple_data, "FINAL")
-        self.output_count += 1
-    
-    def _flush_loop(self):
-        """Periodically flush output buffer."""
+    def _server_loop(self):
+        """Main server loop to receive tuples."""
         while self.running:
-            time.sleep(self.flush_interval)
-            self._flush_output()
+            try:
+                self.server_socket.settimeout(1.0)
+                conn, addr = self.server_socket.accept()
+                threading.Thread(target=self._handle_tuple,
+                               args=(conn, addr), daemon=True).start()
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
+                    self.logger.log(f"SERVER ERROR: {e}")
     
-    def _flush_output(self):
-        """Flush output buffer to HyDFS/local file."""
-        with self.buffer_lock:
-            if not self.output_buffer:
+    def _handle_tuple(self, conn: socket.socket, addr: tuple):
+        """Handle incoming tuple."""
+        try:
+            data = conn.recv(65536).decode('utf-8')
+            if not data:
                 return
             
-            lines = self.output_buffer.copy()
-            self.output_buffer.clear()
-        
-        # Write to file
-        try:
-            # For now, write to local file
-            # TODO: Append to HyDFS
-            os.makedirs("output", exist_ok=True)
-            output_path = f"output/{self.output_file}"
+            msg = json.loads(data)
+            msg_type = msg.get('type')
             
-            with open(output_path, 'a') as f:
-                for line in lines:
-                    f.write(line + '\n')
-            
-            self.logger.log(f"Flushed {len(lines)} lines to {output_path}")
-        
+            if msg_type == 'TUPLE':
+                self._process_tuple(msg)
+                # Send ACK
+                conn.sendall(json.dumps({'status': 'ack'}).encode('utf-8'))
+            elif msg_type == 'ACK':
+                self._handle_ack(msg)
+            elif msg_type == 'EOF':
+                self._handle_eof(msg)
+                conn.sendall(json.dumps({'status': 'ack'}).encode('utf-8'))
         except Exception as e:
-            self.logger.log(f"Flush error: {e}")
-
-# ============================================================================
-# Aggregation Task (Stateful)
-# ============================================================================
-
-class AggregationTask(ProcessingTask):
-    """
-    Stateful aggregation task that maintains running aggregates.
-    """
-    def __init__(self, task_id: str, stage_num: int, vm_id: int,
-                 port: int, op_exe: str, op_args: str,
-                 exactly_once: bool, run_id: str,
-                 group_by_column: int = None):
-        super().__init__(task_id, stage_num, vm_id, port, 
-                        op_exe, op_args, exactly_once, run_id, is_stateful=True)
-        
-        self.group_by_column = group_by_column
-        
-        # Aggregation state: key -> count
-        self.aggregates: Dict[str, int] = {}
-        self.agg_lock = threading.Lock()
+            self.logger.log(f"TUPLE ERROR: {e}")
+        finally:
+            conn.close()
     
-    def _process_tuple(self, tuple_data: StreamTuple) -> List[StreamTuple]:
-        """
-        Process tuple for aggregation.
-        Updates running count and emits updated aggregate.
-        """
-        # Extract group key from value
-        if self.group_by_column is not None:
-            fields = parse_csv_line(tuple_data.value)
-            if 0 < self.group_by_column <= len(fields):
-                group_key = fields[self.group_by_column - 1]
-            else:
-                group_key = ""  # Empty string for missing data
+    def _process_tuple(self, msg: dict):
+        """Process an incoming tuple."""
+        tuple_id = msg.get('tuple_id')
+        key = msg.get('key')
+        value = msg.get('value')
+        
+        # Check for duplicates in exactly-once mode
+        if self.exactly_once and self.eo_tracker:
+            if self.eo_tracker.is_duplicate(tuple_id):
+                return
+        
+        # Run operator
+        output_tuples = self._run_operator(key, value)
+        
+        # Mark as processed
+        if self.exactly_once and self.eo_tracker:
+            self.eo_tracker.mark_processed(tuple_id)
+        
+        self.tuples_processed += 1
+        
+        # Log output
+        for out_key, out_value in output_tuples:
+            self.logger.log(f"OUTPUT: key={out_key} value={out_value}")
+        
+        # Forward to next stage or output
+        if self.stage == self.num_stages - 1:
+            # Last stage - write to HyDFS
+            self._write_output(output_tuples)
         else:
-            group_key = tuple_data.key
+            # Forward to next stage
+            for out_key, out_value in output_tuples:
+                self._forward_tuple(tuple_id, out_key, out_value)
+    
+    def _run_operator(self, key: str, value: str) -> List[tuple]:
+        """Run the operator on input tuple."""
+        try:
+            # Build command
+            cmd = [self.op_exe]
+            if self.op_args:
+                cmd.extend(self.op_args.split())
+            
+            # Run operator with input via stdin
+            input_data = f"{key}\t{value}\n"
+            
+            result = subprocess.run(
+                cmd,
+                input=input_data,
+                capture_output=True,
+                text=True,
+                timeout=5.0
+            )
+            
+            # Parse output
+            output_tuples = []
+            for line in result.stdout.strip().split('\n'):
+                if line:
+                    parts = line.split('\t', 1)
+                    if len(parts) == 2:
+                        output_tuples.append((parts[0], parts[1]))
+                    elif len(parts) == 1:
+                        output_tuples.append((key, parts[0]))
+            
+            return output_tuples
+            
+        except subprocess.TimeoutExpired:
+            self.logger.log(f"OPERATOR TIMEOUT: {self.op_exe}")
+            return []
+        except FileNotFoundError:
+            self.logger.log(f"OPERATOR NOT FOUND: {self.op_exe}")
+            return []
+        except Exception as e:
+            self.logger.log(f"OPERATOR ERROR: {e}")
+            return []
+    
+    def _forward_tuple(self, source_tuple_id: str, key: str, value: str):
+        """Forward tuple to next stage."""
+        if not self.successor_tasks:
+            return
         
-        # Update aggregate
-        with self.agg_lock:
-            if group_key not in self.aggregates:
-                self.aggregates[group_key] = 0
-            self.aggregates[group_key] += 1
-            count = self.aggregates[group_key]
+        # Hash partition
+        target_idx = hash(key) % len(self.successor_tasks)
+        target = self.successor_tasks[target_idx]
         
-        # Emit updated aggregate
-        out_tuple = StreamTuple(key=group_key, value=str(count))
-        return [out_tuple]
-
-# ============================================================================
-# Task Factory
-# ============================================================================
-
-def create_task(task_type: str, task_id: str, stage_num: int,
-                vm_id: int, port: int, run_id: str,
-                exactly_once: bool = True, **kwargs) -> Task:
-    """
-    Factory function to create tasks.
-    """
-    if task_type == 'source':
-        return SourceTask(
-            task_id=task_id,
-            vm_id=vm_id,
-            port=port,
-            input_file=kwargs.get('input_file', ''),
-            input_rate=kwargs.get('input_rate', 100),
-            exactly_once=exactly_once,
-            run_id=run_id,
-            use_local_file=kwargs.get('use_local_file', True)
-        )
+        output_id = f"{source_tuple_id}_{self.task_id}_{time.time()}"
+        
+        tuple_msg = {
+            'type': 'TUPLE',
+            'tuple_id': output_id,
+            'key': key,
+            'value': value,
+            'source_task': self.task_id
+        }
+        
+        # Track for retry if exactly-once
+        if self.exactly_once:
+            with self.pending_lock:
+                self.pending_outputs[output_id] = {
+                    'tuple': tuple_msg,
+                    'target': target,
+                    'retries': 0,
+                    'time': time.time()
+                }
+        
+        self._send_tuple_to_task(target, tuple_msg)
     
-    elif task_type == 'processing':
-        return ProcessingTask(
-            task_id=task_id,
-            stage_num=stage_num,
-            vm_id=vm_id,
-            port=port,
-            op_exe=kwargs.get('op_exe', ''),
-            op_args=kwargs.get('op_args', ''),
-            exactly_once=exactly_once,
-            run_id=run_id
-        )
+    def _send_tuple_to_task(self, target: dict, msg: dict) -> bool:
+        """Send tuple to a task."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5.0)
+            sock.connect((target['hostname'], target['port']))
+            sock.sendall(json.dumps(msg).encode('utf-8'))
+            
+            # Wait for ACK
+            response = sock.recv(1024).decode('utf-8')
+            sock.close()
+            
+            if 'ack' in response:
+                # Mark as acked
+                output_id = msg.get('tuple_id')
+                if self.exactly_once and self.eo_tracker:
+                    self.eo_tracker.mark_output_acked(output_id)
+                
+                with self.pending_lock:
+                    if output_id in self.pending_outputs:
+                        del self.pending_outputs[output_id]
+                
+                return True
+            return False
+        except Exception as e:
+            return False
     
-    elif task_type == 'sink':
-        return SinkTask(
-            task_id=task_id,
-            stage_num=stage_num,
-            vm_id=vm_id,
-            port=port,
-            op_exe=kwargs.get('op_exe', ''),
-            op_args=kwargs.get('op_args', ''),
-            output_file=kwargs.get('output_file', 'output.txt'),
-            exactly_once=exactly_once,
-            run_id=run_id
-        )
+    def _handle_ack(self, msg: dict):
+        """Handle ACK from next stage."""
+        output_id = msg.get('output_id')
+        
+        if self.exactly_once and self.eo_tracker:
+            self.eo_tracker.mark_output_acked(output_id)
+        
+        with self.pending_lock:
+            if output_id in self.pending_outputs:
+                del self.pending_outputs[output_id]
     
-    elif task_type == 'aggregation':
-        return AggregationTask(
-            task_id=task_id,
-            stage_num=stage_num,
-            vm_id=vm_id,
-            port=port,
-            op_exe=kwargs.get('op_exe', ''),
-            op_args=kwargs.get('op_args', ''),
-            exactly_once=exactly_once,
-            run_id=run_id,
-            group_by_column=kwargs.get('group_by_column')
-        )
+    def _handle_eof(self, msg: dict):
+        """Handle EOF signal."""
+        self.eof_received += 1
+        self.logger.log(f"EOF received ({self.eof_received})")
+        
+        # Forward EOF if all inputs received
+        if self.successor_tasks:
+            for target in self.successor_tasks:
+                eof_msg = {'type': 'EOF', 'source_task': self.task_id}
+                self._send_tuple_to_task(target, eof_msg)
+        
+        # Flush and stop if done
+        if self.eo_tracker:
+            self.eo_tracker.flush()
     
-    else:
-        raise ValueError(f"Unknown task type: {task_type}")
+    def _write_output(self, tuples: List[tuple]):
+        """Write output tuples to HyDFS."""
+        if not tuples or not self.hydfs_dest:
+            return
+        
+        # Write to local temp file
+        temp_file = f"/tmp/output_{self.task_id}_{time.time()}.txt"
+        with open(temp_file, 'w') as f:
+            for key, value in tuples:
+                f.write(f"{key}\t{value}\n")
+        
+        # Append to HyDFS
+        if self.hydfs_client:
+            try:
+                self.hydfs_client.append(temp_file, self.hydfs_dest)
+            except Exception as e:
+                self.logger.log(f"OUTPUT ERROR: {e}")
+        
+        # Also print to console
+        for key, value in tuples:
+            print(f"OUTPUT: {key}\t{value}")
+    
+    def _rate_report_loop(self):
+        """Report rate to leader every second."""
+        while self.running:
+            try:
+                time.sleep(1.0)
+                
+                now = time.time()
+                elapsed = now - self.last_rate_time
+                
+                if elapsed > 0:
+                    rate = (self.tuples_processed - self.last_tuple_count) / elapsed
+                    
+                    msg = {
+                        'type': 'RATE_UPDATE',
+                        'task_id': self.task_id,
+                        'rate': rate,
+                        'tuples_processed': self.tuples_processed
+                    }
+                    self._send_to_leader(msg)
+                    
+                    self.last_rate_time = now
+                    self.last_tuple_count = self.tuples_processed
+                    
+            except Exception as e:
+                pass
+    
+    def _retry_loop(self):
+        """Retry pending outputs for exactly-once."""
+        while self.running:
+            try:
+                time.sleep(2.0)
+                
+                with self.pending_lock:
+                    now = time.time()
+                    for output_id, info in list(self.pending_outputs.items()):
+                        # Retry if older than 5 seconds
+                        if now - info['time'] > 5.0 and info['retries'] < 3:
+                            info['retries'] += 1
+                            info['time'] = now
+                            self._send_tuple_to_task(info['target'], info['tuple'])
+                            
+            except Exception as e:
+                pass
 
-# ============================================================================
-# Task Runner (standalone execution)
-# ============================================================================
 
-def run_task_standalone(task_config: Dict):
-    """
-    Run a task as a standalone process.
-    Called when worker spawns a task process.
-    """
-    task_type = task_config['type']
-    task = create_task(
-        task_type=task_type,
-        task_id=task_config['task_id'],
-        stage_num=task_config.get('stage_num', 0),
-        vm_id=task_config['vm_id'],
-        port=task_config['port'],
-        run_id=task_config['run_id'],
-        exactly_once=task_config.get('exactly_once', True),
-        **task_config.get('params', {})
+def main():
+    parser = argparse.ArgumentParser(description='RainStorm Task')
+    parser.add_argument('--task-id', required=True)
+    parser.add_argument('--stage', type=int, required=True)
+    parser.add_argument('--task-idx', type=int, required=True)
+    parser.add_argument('--port', type=int, required=True)
+    parser.add_argument('--op-exe', required=True)
+    parser.add_argument('--op-args', default='')
+    parser.add_argument('--leader-host', required=True)
+    parser.add_argument('--run-id', required=True)
+    parser.add_argument('--vm-id', type=int, required=True)
+    parser.add_argument('--exactly-once', action='store_true')
+    
+    args = parser.parse_args()
+    
+    task = RainStormTask(
+        task_id=args.task_id,
+        stage=args.stage,
+        task_idx=args.task_idx,
+        port=args.port,
+        op_exe=args.op_exe,
+        op_args=args.op_args,
+        leader_host=args.leader_host,
+        run_id=args.run_id,
+        vm_id=args.vm_id,
+        exactly_once=args.exactly_once
     )
     
-    # Set downstream tasks
-    if 'downstream' in task_config:
-        task.set_downstream(task_config['downstream'])
-    
-    # Handle signals
-    def signal_handler(sig, frame):
+    try:
+        task.start()
+    except KeyboardInterrupt:
+        pass
+    finally:
         task.stop()
-        sys.exit(0)
-    
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
-    
-    # Run
-    task.run()
 
 
 if __name__ == '__main__':
-    # Allow running task directly for testing
-    if len(sys.argv) > 1:
-        config_file = sys.argv[1]
-        with open(config_file, 'r') as f:
-            task_config = json.load(f)
-        run_task_standalone(task_config)
+    main()
