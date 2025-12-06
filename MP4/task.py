@@ -472,22 +472,15 @@ class RainStormTask:
             self.eo_tracker.flush()
     
     def _write_output(self, tuples: List[tuple]):
-        """Write output tuples to HyDFS."""
-        if not tuples or not self.hydfs_dest:
+        """Write output tuples to local file (can be collected to HyDFS later)."""
+        if not tuples:
             return
         
-        # Write to local temp file
-        temp_file = f"/tmp/output_{self.task_id}_{time.time()}.txt"
-        with open(temp_file, 'w') as f:
+        # Write to local output file
+        output_file = f"output_{self.task_id}.txt"
+        with open(output_file, 'a') as f:
             for key, value in tuples:
                 f.write(f"{key}\t{value}\n")
-        
-        # Append to HyDFS
-        if self.hydfs_client:
-            try:
-                self.hydfs_client.append(temp_file, self.hydfs_dest)
-            except Exception as e:
-                self.logger.log(f"OUTPUT ERROR: {e}")
         
         # Also print to console
         for key, value in tuples:
