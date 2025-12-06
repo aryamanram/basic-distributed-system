@@ -340,11 +340,17 @@ class RainStormTask:
                           f"stage={self.stage}, num_stages={self.num_stages}, successors={len(self.successor_tasks)}")
 
         # Forward to next stage or output
-        if self.stage == self.num_stages - 1:
+        is_last_stage = (self.stage == self.num_stages - 1)
+        if is_last_stage:
             # Last stage - write to HyDFS
             self._write_output(output_tuples)
         else:
             # Forward to next stage
+            if self.tuples_processed == 1:
+                self.logger.log(f"FORWARDING: stage={self.stage} is NOT last (num_stages={self.num_stages}), "
+                              f"will forward {len(output_tuples)} tuples to {len(self.successor_tasks)} successors")
+                if self.successor_tasks:
+                    self.logger.log(f"SUCCESSORS: {self.successor_tasks}")
             for out_key, out_value in output_tuples:
                 self._forward_tuple(tuple_id, out_key, out_value)
     
@@ -359,14 +365,21 @@ class RainStormTask:
             # Run operator with input via stdin
             input_data = f"{key}\t{value}\n"
             
+            # Run in same directory as task.py
+            task_dir = os.path.dirname(os.path.abspath(__file__))
             result = subprocess.run(
                 cmd,
                 input=input_data,
                 capture_output=True,
                 text=True,
-                timeout=5.0
+                timeout=5.0,
+                cwd=task_dir
             )
-            
+
+            # Log stderr if any
+            if result.stderr:
+                self.logger.log(f"OPERATOR STDERR: {result.stderr[:200]}")
+
             # Parse output
             output_tuples = []
             for line in result.stdout.strip().split('\n'):
