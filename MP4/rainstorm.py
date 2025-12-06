@@ -506,9 +506,12 @@ class RainStormLeader:
         
         response = self._send_to_worker(hostname, msg)
         if response and response.get('status') == 'success':
-            self.logger.log(f"TASK STARTED: {task.task_id} on VM{task.vm_id}")
+            # Update task info with PID and log_file from worker
+            task.pid = response.get('pid', 0)
+            task.log_file = response.get('log_file', f"task_{task.task_id}_{self.run_id}.log")
+            self.logger.log(f"TASK STARTED: {task.task_id} on VM{task.vm_id} PID={task.pid}")
         else:
-            self.logger.log(f"TASK START FAILED: {task.task_id}")
+            self.logger.log(f"TASK START FAILED: {task.task_id} - {response}")
     
     def _start_task_locally(self, task: TaskInfo):
         """Start a task locally on the leader."""
@@ -897,7 +900,7 @@ class RainStormWorker:
         
         self.logger.log(f"TASK STARTED: {task_id} PID={process.pid}")
         
-        return {'status': 'success', 'pid': process.pid}
+        return {'status': 'success', 'pid': process.pid, 'log_file': log_file}
     
     def _handle_kill_process(self, msg: dict) -> dict:
         """Kill a process by PID."""
