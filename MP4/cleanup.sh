@@ -127,4 +127,10 @@ for d in "$MP2_DIR" "$MP3_DIR" "$MP4_DIR"; do
 done
 
 echo ""
+echo "--- Setting permissions ---"
+
+# Make operator scripts executable
+chmod +x "$MP4_DIR"/*.py 2>/dev/null && echo "Made Python scripts executable"
+
+echo ""
 echo "=== Cleanup complete ==="
