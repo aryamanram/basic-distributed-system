@@ -14,21 +14,6 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional, Set
 
-# Add parent directory to path for MP2/MP3 imports
-_parent_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
-sys.path.insert(0, _parent_dir)
-
-# Also add MP3 directory itself so its internal imports work
-_mp3_dir = os.path.join(_parent_dir, 'MP3')
-sys.path.insert(0, _mp3_dir)
-
-# Also add MP2 directory
-_mp2_dir = os.path.join(_parent_dir, 'MP2')
-sys.path.insert(0, _mp2_dir)
-
-from node import HyDFSNode
-from main import HyDFSClient
-
 RAINSTORM_PORT = 8000
 TASK_BASE_PORT = 8100
 
@@ -59,40 +44,32 @@ class TaskLogger:
 class ExactlyOnceTracker:
     """
     Tracks processed tuples for exactly-once semantics.
-    Uses HyDFS for persistence.
+    Uses local file for persistence (can be synced to HyDFS separately).
     """
     
-    def __init__(self, task_id: str, hydfs_client: HyDFSClient, logger: TaskLogger):
+    def __init__(self, task_id: str, hydfs_client, logger: TaskLogger):
         self.task_id = task_id
-        self.hydfs_client = hydfs_client
+        self.hydfs_client = hydfs_client  # May be None
         self.logger = logger
         
         self.processed_ids: Set[str] = set()
         self.acked_outputs: Set[str] = set()
         self.lock = threading.Lock()
         
-        self.hydfs_log_file = f"rainstorm_log_{task_id}.log"
         self.local_log_file = f"eo_log_{task_id}.log"
         
         # Batch for efficiency
         self.pending_log_entries: List[str] = []
         self.batch_size = 10
         
-        # Load existing state
+        # Load existing state from local file
         self._load_state()
     
     def _load_state(self):
-        """Load state from HyDFS log file."""
+        """Load state from local log file."""
         try:
-            # Merge first
-            self.hydfs_client.merge(self.hydfs_log_file)
-            
-            # Get log file
-            temp_file = f"/tmp/{self.hydfs_log_file}"
-            self.hydfs_client.get(self.hydfs_log_file, temp_file)
-            
-            if os.path.exists(temp_file):
-                with open(temp_file, 'r') as f:
+            if os.path.exists(self.local_log_file):
+                with open(self.local_log_file, 'r') as f:
                     for line in f:
                         line = line.strip()
                         if line.startswith('PROCESSED:'):
@@ -122,7 +99,7 @@ class ExactlyOnceTracker:
             self.pending_log_entries.append(f"PROCESSED:{tuple_id}")
             
             if len(self.pending_log_entries) >= self.batch_size:
-                self._flush_to_hydfs()
+                self._flush_to_file()
     
     def mark_output_acked(self, output_id: str):
         """Mark an output as acknowledged by next stage."""
@@ -131,31 +108,22 @@ class ExactlyOnceTracker:
             self.pending_log_entries.append(f"ACK:{output_id}")
             
             if len(self.pending_log_entries) >= self.batch_size:
-                self._flush_to_hydfs()
+                self._flush_to_file()
     
     def is_output_acked(self, output_id: str) -> bool:
         """Check if an output has been acknowledged."""
         with self.lock:
             return output_id in self.acked_outputs
     
-    def _flush_to_hydfs(self):
-        """Flush pending log entries to HyDFS."""
+    def _flush_to_file(self):
+        """Flush pending log entries to local file."""
         if not self.pending_log_entries:
             return
         
         try:
-            # Write to local file first
             with open(self.local_log_file, 'a') as f:
                 for entry in self.pending_log_entries:
                     f.write(entry + "\n")
-            
-            # Append to HyDFS
-            temp_file = f"/tmp/eo_batch_{self.task_id}_{time.time()}.log"
-            with open(temp_file, 'w') as f:
-                for entry in self.pending_log_entries:
-                    f.write(entry + "\n")
-            
-            self.hydfs_client.append(temp_file, self.hydfs_log_file)
             
             self.pending_log_entries.clear()
         except Exception as e:
@@ -164,7 +132,7 @@ class ExactlyOnceTracker:
     def flush(self):
         """Force flush pending entries."""
         with self.lock:
-            self._flush_to_hydfs()
+            self._flush_to_file()
 
 
 class RainStormTask:
@@ -192,9 +160,7 @@ class RainStormTask:
         self.running = False
         self.server_socket: Optional[socket.socket] = None
         
-        # HyDFS for exactly-once
-        self.hydfs_node: Optional[HyDFSNode] = None
-        self.hydfs_client: Optional[HyDFSClient] = None
+        # Exactly-once tracker
         self.eo_tracker: Optional[ExactlyOnceTracker] = None
         
         # Task configuration from leader
@@ -223,15 +189,9 @@ class RainStormTask:
         self.logger.log(f"TASK START: stage={self.stage} idx={self.task_idx} "
                        f"op={self.op_exe} args={self.op_args}")
         
-        # Initialize HyDFS if exactly-once
+        # Initialize exactly-once tracker (file-based, no HyDFS dependency)
         if self.exactly_once:
-            self.hydfs_node = HyDFSNode(self.vm_id)
-            self.hydfs_node.start()
-            self.hydfs_node.membership.join_group()
-            time.sleep(1)
-            
-            self.hydfs_client = HyDFSClient(self.hydfs_node)
-            self.eo_tracker = ExactlyOnceTracker(self.task_id, self.hydfs_client, self.logger)
+            self.eo_tracker = ExactlyOnceTracker(self.task_id, None, self.logger)
         
         # Get configuration from leader
         self._get_config_from_leader()
@@ -264,10 +224,6 @@ class RainStormTask:
         
         if self.server_socket:
             self.server_socket.close()
-        
-        if self.hydfs_node:
-            self.hydfs_node.membership.leave_group()
-            self.hydfs_node.stop()
         
         self._notify_leader_completed()
         
