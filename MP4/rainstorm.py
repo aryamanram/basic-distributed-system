@@ -37,6 +37,7 @@ from main import HyDFSClient
 # Ports
 RAINSTORM_PORT = 8000
 TASK_BASE_PORT = 8100
+MAX_TASKS_PER_STAGE = 10  # Used for port calculation: port = TASK_BASE_PORT + (stage * MAX_TASKS_PER_STAGE) + task_idx
 
 # Configuration
 VM_HOSTS = {
@@ -58,6 +59,20 @@ def get_vm_id_from_hostname(hostname: str) -> int:
         if host == hostname or hostname.startswith(f"fa25-cs425-a7{vm_id:02d}"):
             return vm_id
     return 1
+
+def get_task_port(stage: int, task_idx: int) -> int:
+    """Calculate the port for a task based on stage and task index.
+
+    This ensures tasks in different stages don't collide on the same port.
+    Port = TASK_BASE_PORT + (stage * MAX_TASKS_PER_STAGE) + task_idx
+
+    Examples:
+      Stage 0, Task 0 -> 8100
+      Stage 0, Task 1 -> 8101
+      Stage 1, Task 0 -> 8110
+      Stage 1, Task 1 -> 8111
+    """
+    return TASK_BASE_PORT + (stage * MAX_TASKS_PER_STAGE) + task_idx
 
 def get_timestamp() -> str:
     """Get formatted timestamp."""
@@ -356,7 +371,7 @@ class RainStormLeader:
                             'task_id': tid,
                             'vm_id': t.vm_id,
                             'hostname': VM_HOSTS[t.vm_id],
-                            'port': TASK_BASE_PORT + t.task_idx
+                            'port': get_task_port(t.stage, t.task_idx)
                         })
         
         return config
@@ -516,8 +531,8 @@ class RainStormLeader:
     def _start_task_locally(self, task: TaskInfo):
         """Start a task locally on the leader."""
         import subprocess
-        
-        task_port = TASK_BASE_PORT + task.task_idx
+
+        task_port = get_task_port(task.stage, task.task_idx)
         log_file = f"task_{task.task_id}_{self.run_id}.log"
         
         cmd = [
@@ -589,7 +604,7 @@ class RainStormLeader:
                         stage0_tasks.append({
                             'task_id': task_id,
                             'hostname': VM_HOSTS[t.vm_id],
-                            'port': TASK_BASE_PORT + t.task_idx
+                            'port': get_task_port(t.stage, t.task_idx)
                         })
             
             if not stage0_tasks:
@@ -866,11 +881,11 @@ class RainStormWorker:
         exactly_once = msg.get('exactly_once', False)
         leader_host = msg.get('leader_host')
         run_id = msg.get('run_id')
-        
+
         # Start task process
         import subprocess
-        
-        task_port = TASK_BASE_PORT + task_idx
+
+        task_port = get_task_port(stage, task_idx)
         log_file = f"task_{task_id}_{run_id}.log"
         
         cmd = [
