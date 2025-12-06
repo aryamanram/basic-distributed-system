@@ -327,17 +327,18 @@ class RainStormTask:
         
         # Run operator
         output_tuples = self._run_operator(key, value)
-        
+
         # Mark as processed
         if self.exactly_once and self.eo_tracker:
             self.eo_tracker.mark_processed(tuple_id)
-        
+
         self.tuples_processed += 1
-        
-        # Log output
-        for out_key, out_value in output_tuples:
-            self.logger.log(f"OUTPUT: key={out_key} value={out_value}")
-        
+
+        # Log output count (not every tuple to avoid spam)
+        if self.tuples_processed % 100 == 1:
+            self.logger.log(f"PROCESSED: tuple #{self.tuples_processed}, produced {len(output_tuples)} outputs, "
+                          f"stage={self.stage}, num_stages={self.num_stages}, successors={len(self.successor_tasks)}")
+
         # Forward to next stage or output
         if self.stage == self.num_stages - 1:
             # Last stage - write to HyDFS
@@ -391,14 +392,15 @@ class RainStormTask:
     def _forward_tuple(self, source_tuple_id: str, key: str, value: str):
         """Forward tuple to next stage."""
         if not self.successor_tasks:
+            self.logger.log(f"FORWARD SKIP: No successor tasks configured")
             return
-        
+
         # Hash partition
         target_idx = hash(key) % len(self.successor_tasks)
         target = self.successor_tasks[target_idx]
-        
+
         output_id = f"{source_tuple_id}_{self.task_id}_{time.time()}"
-        
+
         tuple_msg = {
             'type': 'TUPLE',
             'tuple_id': output_id,
@@ -406,7 +408,7 @@ class RainStormTask:
             'value': value,
             'source_task': self.task_id
         }
-        
+
         # Track for retry if exactly-once
         if self.exactly_once:
             with self.pending_lock:
@@ -416,8 +418,10 @@ class RainStormTask:
                     'retries': 0,
                     'time': time.time()
                 }
-        
-        self._send_tuple_to_task(target, tuple_msg)
+
+        success = self._send_tuple_to_task(target, tuple_msg)
+        if not success:
+            self.logger.log(f"FORWARD FAILED: to {target['task_id']} at {target['hostname']}:{target['port']}")
     
     def _send_tuple_to_task(self, target: dict, msg: dict) -> bool:
         """Send tuple to a task."""
@@ -426,24 +430,25 @@ class RainStormTask:
             sock.settimeout(5.0)
             sock.connect((target['hostname'], target['port']))
             sock.sendall(json.dumps(msg).encode('utf-8'))
-            
+
             # Wait for ACK
             response = sock.recv(1024).decode('utf-8')
             sock.close()
-            
+
             if 'ack' in response:
                 # Mark as acked
                 output_id = msg.get('tuple_id')
                 if self.exactly_once and self.eo_tracker:
                     self.eo_tracker.mark_output_acked(output_id)
-                
+
                 with self.pending_lock:
                     if output_id in self.pending_outputs:
                         del self.pending_outputs[output_id]
-                
+
                 return True
             return False
         except Exception as e:
+            self.logger.log(f"SEND ERROR to {target.get('hostname')}:{target.get('port')}: {e}")
             return False
     
     def _handle_ack(self, msg: dict):
