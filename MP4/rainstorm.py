@@ -345,6 +345,16 @@ class RainStormLeader:
             task = self.tasks[task_id]
             stage = task.stage
         
+        # Calculate number of predecessor tasks (for EOF tracking)
+        if stage == 0:
+            # Stage 0 receives from source only
+            num_predecessors = 1
+        else:
+            # Other stages receive from all tasks in previous stage
+            prev_stage = stage - 1
+            with self.tasks_lock:
+                num_predecessors = len(self.stage_tasks.get(prev_stage, []))
+
         # Build task configuration
         config = {
             'status': 'success',
@@ -356,9 +366,10 @@ class RainStormLeader:
             'exactly_once': self.exactly_once,
             'hydfs_dest': self.job_config.get('hydfs_dest') if self.job_config else '',
             'num_stages': len(self.stages),
-            'input_rate': self.input_rate
+            'input_rate': self.input_rate,
+            'num_predecessors': num_predecessors
         }
-        
+
         # Add successor task info
         if stage < len(self.stages) - 1:
             next_stage = stage + 1
@@ -373,7 +384,7 @@ class RainStormLeader:
                             'hostname': VM_HOSTS[t.vm_id],
                             'port': get_task_port(t.stage, t.task_idx)
                         })
-        
+
         return config
     
     def _send_to_worker(self, hostname: str, msg: dict, timeout: float = 10.0) -> Optional[dict]:
@@ -434,14 +445,17 @@ class RainStormLeader:
         
         # Schedule tasks across workers
         self._schedule_tasks(workers)
-        
+
+        # Wait for all tasks to be ready before starting source
+        self._wait_for_tasks_ready()
+
         # Start monitoring threads
         self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self.monitor_thread.start()
-        
+
         self.rate_log_thread = threading.Thread(target=self._rate_log_loop, daemon=True)
         self.rate_log_thread.start()
-        
+
         # Start the source on the leader
         self._start_source(hydfs_src)
     
@@ -497,7 +511,41 @@ class RainStormLeader:
         # Send start commands to workers
         for task_id, task in self.tasks.items():
             self._start_task_on_worker(task)
-    
+
+    def _wait_for_tasks_ready(self):
+        """Wait for all tasks to be ready (listening on their ports)."""
+        self.logger.log("Waiting for tasks to be ready...")
+
+        max_wait = 10.0  # Maximum wait time in seconds
+        start_time = time.time()
+
+        while time.time() - start_time < max_wait:
+            all_ready = True
+            with self.tasks_lock:
+                for task_id, task in self.tasks.items():
+                    if task.pid == 0:
+                        all_ready = False
+                        break
+                    # Try to connect to task port to verify it's listening
+                    hostname = VM_HOSTS[task.vm_id]
+                    port = get_task_port(task.stage, task.task_idx)
+                    try:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.settimeout(0.5)
+                        sock.connect((hostname, port))
+                        sock.close()
+                    except:
+                        all_ready = False
+                        break
+
+            if all_ready:
+                self.logger.log("All tasks ready")
+                return
+
+            time.sleep(0.2)
+
+        self.logger.log("WARNING: Timeout waiting for tasks, proceeding anyway")
+
     def _start_task_on_worker(self, task: TaskInfo):
         """Start a task on its assigned worker."""
         hostname = VM_HOSTS[task.vm_id]

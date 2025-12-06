@@ -240,9 +240,10 @@ class RainStormTask:
                 self.successor_tasks = response.get('successor_tasks', [])
                 self.hydfs_dest = response.get('hydfs_dest', '')
                 self.num_stages = response.get('num_stages', 1)
-                
+                self.expected_eof = response.get('num_predecessors', 1)
+
                 self.logger.log(f"CONFIG: successors={len(self.successor_tasks)} "
-                              f"dest={self.hydfs_dest}")
+                              f"dest={self.hydfs_dest} expected_eof={self.expected_eof}")
         except Exception as e:
             self.logger.log(f"CONFIG ERROR: {e}")
     
@@ -459,17 +460,29 @@ class RainStormTask:
     def _handle_eof(self, msg: dict):
         """Handle EOF signal."""
         self.eof_received += 1
-        self.logger.log(f"EOF received ({self.eof_received})")
-        
-        # Forward EOF if all inputs received
-        if self.successor_tasks:
-            for target in self.successor_tasks:
-                eof_msg = {'type': 'EOF', 'source_task': self.task_id}
-                self._send_tuple_to_task(target, eof_msg)
-        
-        # Flush and stop if done
-        if self.eo_tracker:
-            self.eo_tracker.flush()
+        self.logger.log(f"EOF received ({self.eof_received}/{self.expected_eof})")
+
+        # Check if we've received all expected EOFs
+        if self.eof_received >= self.expected_eof:
+            self.logger.log("All EOFs received, finishing up...")
+
+            # Forward EOF to all successor tasks
+            if self.successor_tasks:
+                for target in self.successor_tasks:
+                    eof_msg = {'type': 'EOF', 'source_task': self.task_id}
+                    self._send_tuple_to_task(target, eof_msg)
+                self.logger.log(f"Forwarded EOF to {len(self.successor_tasks)} successors")
+
+            # Flush exactly-once tracker
+            if self.eo_tracker:
+                self.eo_tracker.flush()
+
+            # Give a moment for any pending operations to complete
+            time.sleep(0.5)
+
+            # Stop the task
+            self.logger.log("Task complete, shutting down")
+            self.running = False
     
     def _write_output(self, tuples: List[tuple]):
         """Write output tuples to local file (can be collected to HyDFS later)."""
