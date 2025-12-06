@@ -443,7 +443,7 @@ class RainStormLeader:
                         'task_id': task_id,
                         'vm_id': t.vm_id,
                         'hostname': VM_HOSTS[t.vm_id],
-                        'port': TASK_BASE_PORT + t.task_idx
+                        'port': TASK_BASE_PORT + (t.stage * 100) + t.task_idx
                     })
         
         return {'status': 'success', 'successor_tasks': successor_tasks}
@@ -616,7 +616,7 @@ class RainStormLeader:
                             'task_id': tid,
                             'vm_id': t.vm_id,
                             'hostname': VM_HOSTS[t.vm_id],
-                            'port': TASK_BASE_PORT + t.task_idx
+                            'port': TASK_BASE_PORT + (t.stage * 100) + t.task_idx
                         })
         
         return config
@@ -873,7 +873,7 @@ class RainStormLeader:
         """Start a task locally on the leader VM."""
         import subprocess
         
-        task_port = TASK_BASE_PORT + task.task_idx
+        task_port = TASK_BASE_PORT + (stage * 100) + task_idx
         log_file = f"task_{task.task_id}.log"
         
         cmd = [
@@ -1032,7 +1032,7 @@ class RainStormLeader:
                     tasks.append({
                         'task_id': task_id,
                         'hostname': VM_HOSTS[t.vm_id],
-                        'port': TASK_BASE_PORT + t.task_idx
+                        'port': TASK_BASE_PORT + (t.stage * 100) + t.task_idx
                     })
         return tasks
     
@@ -1438,7 +1438,7 @@ class RainStormWorker:
         run_id = msg.get('run_id')
         is_stateful = msg.get('is_stateful', False)
         
-        task_port = TASK_BASE_PORT + task_idx
+        task_port = TASK_BASE_PORT + (stage * 100) + task_idx
         log_file = f"task_{task_id}.log"
         
         cmd = [
