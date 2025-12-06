@@ -12,12 +12,12 @@ from typing import List, Optional, Dict, Any
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from MP2.membership import MembershipService
-from ring import ConsistentHashRing
-from storage import FileStorage, FileBlock
-from consistency import ConsistencyManager, MergeCoordinator
-from network import NetworkManager
-from replication import ReplicationManager, REPLICATION_FACTOR
-from utils import Logger, get_node_id, get_file_id
+from MP3.ring import ConsistentHashRing
+from MP3.storage import FileStorage, FileBlock
+from MP3.consistency import ConsistencyManager, MergeCoordinator
+from MP3.network import NetworkManager
+from MP3.replication import ReplicationManager, REPLICATION_FACTOR
+from MP3.utils import Logger, get_node_id, get_file_id
 
 HYDFS_PORT = 7000
 

@@ -5,7 +5,7 @@ import socket
 import threading
 import time
 from typing import Dict, Any, Optional, Callable
-from utils import serialize_message, deserialize_message, send_sized_message, recv_sized_message
+from MP3.utils import serialize_message, deserialize_message, send_sized_message, recv_sized_message
 
 class NetworkManager:
     """

@@ -4,7 +4,7 @@ Replication management for HyDFS
 import threading
 import time
 from typing import List, Dict, Set, Optional
-from storage import FileBlock
+from MP3.storage import FileBlock
 
 # Replication factor: 3 replicas to tolerate 2 failures
 REPLICATION_FACTOR = 3

@@ -9,9 +9,9 @@ import socket
 import threading
 from typing import Optional
 
-from node import HyDFSNode, HYDFS_PORT
-from storage import FileBlock
-from utils import get_file_id
+from MP3.node import HyDFSNode, HYDFS_PORT
+from MP3.storage import FileBlock
+from MP3.utils import get_file_id
 
 HYDFS_CONTROL_PORT = 9091
 

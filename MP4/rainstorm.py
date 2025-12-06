@@ -13,11 +13,21 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional, Set, Tuple
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+# Add parent directory to path for MP2/MP3 imports
+_parent_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
+sys.path.insert(0, _parent_dir)
 
-from MP2.membership import MembershipService, MemberStatus
-from MP3.node import HyDFSNode
-from MP3.main import HyDFSClient
+# Also add MP3 directory itself so its internal imports work
+_mp3_dir = os.path.join(_parent_dir, 'MP3')
+sys.path.insert(0, _mp3_dir)
+
+# Also add MP2 directory
+_mp2_dir = os.path.join(_parent_dir, 'MP2')
+sys.path.insert(0, _mp2_dir)
+
+from membership import MembershipService, MemberStatus
+from node import HyDFSNode
+from main import HyDFSClient
 
 # Ports
 RAINSTORM_PORT = 8000

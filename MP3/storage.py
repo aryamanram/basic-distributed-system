@@ -6,7 +6,7 @@ import json
 import threading
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
-from utils import get_file_id
+from MP3.utils import get_file_id
 
 @dataclass
 class FileBlock:

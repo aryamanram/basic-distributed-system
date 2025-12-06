@@ -4,7 +4,7 @@ Consistency management and merge operations for HyDFS
 import threading
 import time
 from typing import Dict, List, Optional, Set
-from storage import FileBlock
+from MP3.storage import FileBlock
 
 class ClientSequenceTracker:
     """
