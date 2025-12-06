@@ -873,7 +873,7 @@ class RainStormLeader:
         """Start a task locally on the leader VM."""
         import subprocess
         
-        task_port = TASK_BASE_PORT + (stage * 100) + task_idx
+        task_port = TASK_BASE_PORT + (task.stage * 100) + task.task_idx
         log_file = f"task_{task.task_id}.log"
         
         cmd = [
