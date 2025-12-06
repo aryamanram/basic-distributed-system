@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-RainStorm Task - Individual task process that runs an operator.
-Implements exactly-once semantics with HyDFS-backed logs, proper EOF handling,
-and heartbeat reporting for failure detection.
+RainStorm Task - Individual task process that runs an operator
+Handles tuple processing, exactly-once semantics, and rate reporting
 """
 import argparse
 import json
@@ -15,24 +14,8 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional, Set
 
-# Add parent directory to path for MP3 imports
-_parent_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
-sys.path.insert(0, _parent_dir)
-sys.path.insert(0, os.path.join(_parent_dir, 'MP3'))
-
-try:
-    from node import HyDFSNode
-    from main import HyDFSClient
-    HYDFS_AVAILABLE = True
-except ImportError:
-    HYDFS_AVAILABLE = False
-    HyDFSNode = None
-    HyDFSClient = None
-
 RAINSTORM_PORT = 8000
 TASK_BASE_PORT = 8100
-HEARTBEAT_INTERVAL = 2.0
-RATE_REPORT_INTERVAL = 1.0
 
 
 def get_timestamp() -> str:
@@ -45,9 +28,8 @@ class TaskLogger:
     
     def __init__(self, task_id: str, run_id: str, vm_id: int):
         self.task_id = task_id
-        self.run_id = run_id
+        self.log_file = f"task_{task_id}_{run_id}.log"
         self.vm_id = vm_id
-        self.log_file = f"task_{task_id}.log"
         self.lock = threading.Lock()
     
     def log(self, msg: str):
@@ -62,104 +44,45 @@ class TaskLogger:
 class ExactlyOnceTracker:
     """
     Tracks processed tuples for exactly-once semantics.
-    Uses HyDFS for persistence to survive failures.
-    Falls back to local file if HyDFS is unavailable.
+    Uses local file for persistence (can be synced to HyDFS separately).
     """
     
-    def __init__(self, task_id: str, run_id: str, logger: TaskLogger,
-                 hydfs_client: Optional['HyDFSClient'] = None,
-                 leader_host: str = ''):
+    def __init__(self, task_id: str, hydfs_client, logger: TaskLogger):
         self.task_id = task_id
-        self.run_id = run_id
+        self.hydfs_client = hydfs_client  # May be None
         self.logger = logger
-        self.hydfs_client = hydfs_client
-        self.leader_host = leader_host
         
-        # In-memory state
         self.processed_ids: Set[str] = set()
         self.acked_outputs: Set[str] = set()
         self.lock = threading.Lock()
         
-        # HyDFS log file name (unique per task identity, persists across restarts)
-        self.hydfs_log_file = f"rainstorm_eo_{task_id}.log"
-        self.local_log_file = f"eo_log_{task_id}_{run_id}.log"
+        self.local_log_file = f"eo_log_{task_id}.log"
         
-        # Batch pending writes for efficiency
+        # Batch for efficiency
         self.pending_log_entries: List[str] = []
         self.batch_size = 10
-        self.last_flush_time = time.time()
-        self.flush_interval = 1.0  # Flush every second
         
-        # Load existing state
-        self._load_state_from_hydfs()
+        # Load existing state from local file
+        self._load_state()
     
-    def _load_state_from_hydfs(self):
-        """Load state from HyDFS log file (with merge first per spec)."""
-        # First try to load from HyDFS via leader
-        if self.leader_host:
-            try:
-                # Request merge and get log from leader
-                self._request_merge_and_load()
-                return
-            except Exception as e:
-                self.logger.log(f"EO: HyDFS load failed: {e}")
-        
-        # Fallback to local file
-        self._load_state_from_local()
-    
-    def _request_merge_and_load(self):
-        """Request leader to merge and return EO log contents."""
+    def _load_state(self):
+        """Load state from local log file."""
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(30.0)
-            sock.connect((self.leader_host, RAINSTORM_PORT))
-            
-            msg = {
-                'type': 'GET_EO_LOG',
-                'task_id': self.task_id,
-                'log_file': self.hydfs_log_file
-            }
-            sock.sendall(json.dumps(msg).encode('utf-8'))
-            
-            response = sock.recv(1048576).decode('utf-8')  # 1MB max
-            sock.close()
-            
-            result = json.loads(response)
-            if result.get('status') == 'success':
-                log_content = result.get('content', '')
-                if log_content:
-                    for line in log_content.split('\n'):
+            if os.path.exists(self.local_log_file):
+                with open(self.local_log_file, 'r') as f:
+                    for line in f:
                         line = line.strip()
                         if line.startswith('PROCESSED:'):
-                            self.processed_ids.add(line[10:])
+                            tuple_id = line[10:]
+                            self.processed_ids.add(tuple_id)
                         elif line.startswith('ACK:'):
-                            self.acked_outputs.add(line[4:])
-                    
-                    self.logger.log(f"EO: Loaded {len(self.processed_ids)} processed, "
-                                  f"{len(self.acked_outputs)} acked from HyDFS")
+                            output_id = line[4:]
+                            self.acked_outputs.add(output_id)
+                
+                self.logger.log(f"EO: Loaded {len(self.processed_ids)} processed, "
+                              f"{len(self.acked_outputs)} acked")
         except Exception as e:
-            self.logger.log(f"EO: Could not load from HyDFS via leader: {e}")
-    
-    def _load_state_from_local(self):
-        """Load state from local log file as fallback."""
-        if os.path.exists(self.local_log_file):
-            self._replay_log_file(self.local_log_file)
-            self.logger.log(f"EO: Loaded {len(self.processed_ids)} processed from local")
-    
-    def _replay_log_file(self, filepath: str):
-        """Replay a log file to restore state."""
-        try:
-            with open(filepath, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith('PROCESSED:'):
-                        tuple_id = line[10:]
-                        self.processed_ids.add(tuple_id)
-                    elif line.startswith('ACK:'):
-                        output_id = line[4:]
-                        self.acked_outputs.add(output_id)
-        except Exception as e:
-            self.logger.log(f"EO: Error replaying log: {e}")
+            self.logger.log(f"EO: No existing log (new task): {e}")
     
     def is_duplicate(self, tuple_id: str) -> bool:
         """Check if a tuple has already been processed."""
@@ -174,82 +97,53 @@ class ExactlyOnceTracker:
         with self.lock:
             self.processed_ids.add(tuple_id)
             self.pending_log_entries.append(f"PROCESSED:{tuple_id}")
-            self._maybe_flush()
+            
+            if len(self.pending_log_entries) >= self.batch_size:
+                self._flush_to_file()
     
     def mark_output_acked(self, output_id: str):
         """Mark an output as acknowledged by next stage."""
         with self.lock:
             self.acked_outputs.add(output_id)
             self.pending_log_entries.append(f"ACK:{output_id}")
-            self._maybe_flush()
+            
+            if len(self.pending_log_entries) >= self.batch_size:
+                self._flush_to_file()
     
     def is_output_acked(self, output_id: str) -> bool:
         """Check if an output has been acknowledged."""
         with self.lock:
             return output_id in self.acked_outputs
     
-    def _maybe_flush(self):
-        """Flush if batch is full or enough time has passed."""
-        if len(self.pending_log_entries) >= self.batch_size:
-            self._flush()
-        elif time.time() - self.last_flush_time > self.flush_interval:
-            self._flush()
-    
-    def _flush(self):
-        """Flush pending entries to storage."""
+    def _flush_to_file(self):
+        """Flush pending log entries to local file."""
         if not self.pending_log_entries:
             return
         
-        entries_to_write = self.pending_log_entries.copy()
-        self.pending_log_entries.clear()
-        self.last_flush_time = time.time()
-        
-        # Write to local file first (fast, for recovery if HyDFS fails)
         try:
             with open(self.local_log_file, 'a') as f:
-                for entry in entries_to_write:
+                for entry in self.pending_log_entries:
                     f.write(entry + "\n")
+            
+            self.pending_log_entries.clear()
         except Exception as e:
-            self.logger.log(f"EO: Local flush error: {e}")
-        
-        # Then append to HyDFS via leader (provides durability)
-        if self.leader_host:
-            try:
-                log_content = "\n".join(entries_to_write) + "\n"
-                
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(10.0)
-                sock.connect((self.leader_host, RAINSTORM_PORT))
-                
-                msg = {
-                    'type': 'APPEND_EO_LOG',
-                    'task_id': self.task_id,
-                    'log_file': self.hydfs_log_file,
-                    'content': log_content
-                }
-                sock.sendall(json.dumps(msg).encode('utf-8'))
-                sock.recv(1024)
-                sock.close()
-                
-            except Exception as e:
-                self.logger.log(f"EO: HyDFS append error: {e}")
+            self.logger.log(f"EO: Flush error: {e}")
     
     def flush(self):
-        """Force flush all pending entries."""
+        """Force flush pending entries."""
         with self.lock:
-            self._flush()
+            self._flush_to_file()
 
 
 class RainStormTask:
     """
     Individual RainStorm task process.
-    Receives tuples, processes them with an operator, and forwards to next stage.
-    Supports exactly-once semantics and proper EOF handling.
+    Receives tuples, processes them with operator, and forwards to next stage.
     """
     
     def __init__(self, task_id: str, stage: int, task_idx: int, port: int,
                  op_exe: str, op_args: str, leader_host: str, run_id: str,
-                 vm_id: int, exactly_once: bool, is_stateful: bool = False):
+                 vm_id: int, exactly_once: bool):
         self.task_id = task_id
         self.stage = stage
         self.task_idx = task_idx
@@ -260,12 +154,10 @@ class RainStormTask:
         self.run_id = run_id
         self.vm_id = vm_id
         self.exactly_once = exactly_once
-        self.is_stateful = is_stateful
         
         self.logger = TaskLogger(task_id, run_id, vm_id)
         
         self.running = False
-        self.shutdown_requested = False
         self.server_socket: Optional[socket.socket] = None
         
         # Exactly-once tracker
@@ -277,39 +169,29 @@ class RainStormTask:
         self.hydfs_dest: str = ''
         self.num_stages: int = 0
         
-        # EOF tracking - count EOFs from all predecessors
-        self.eof_received = 0
-        self.expected_eof = 1  # Default: expect 1 EOF
-        
         # Rate tracking
         self.tuples_processed = 0
         self.last_rate_time = time.time()
         self.last_tuple_count = 0
         
-        # Pending outputs for retry (exactly-once)
-        self.pending_outputs: Dict[str, dict] = {}
+        # Pending outputs for retry
+        self.pending_outputs: Dict[str, dict] = {}  # output_id -> {tuple, target, retries}
         self.pending_lock = threading.Lock()
         
-        # Output buffering for HyDFS writes (final stage only)
-        self.output_buffer: List[str] = []
-        self.output_buffer_lock = threading.Lock()
-        self.output_batch_size = 50
+        # EOF tracking
+        self.eof_received = 0
+        self.expected_eof = 0
     
     def start(self):
         """Start the task."""
         self.running = True
         
         self.logger.log(f"TASK START: stage={self.stage} idx={self.task_idx} "
-                       f"op={self.op_exe} args={self.op_args} "
-                       f"exactly_once={self.exactly_once} stateful={self.is_stateful}")
+                       f"op={self.op_exe} args={self.op_args}")
         
-        # Initialize exactly-once tracker with HyDFS support
+        # Initialize exactly-once tracker (file-based, no HyDFS dependency)
         if self.exactly_once:
-            self.eo_tracker = ExactlyOnceTracker(
-                self.task_id, self.run_id, self.logger,
-                hydfs_client=None,  # We use leader as proxy
-                leader_host=self.leader_host
-            )
+            self.eo_tracker = ExactlyOnceTracker(self.task_id, None, self.logger)
         
         # Get configuration from leader
         self._get_config_from_leader()
@@ -318,77 +200,51 @@ class RainStormTask:
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_socket.bind(('', self.port))
-        self.server_socket.listen(50)
+        self.server_socket.listen(20)
         
-        # Notify leader that we've started
+        # Notify leader
         self._notify_leader_started()
         
-        # Start background threads
+        # Start rate reporting thread
         threading.Thread(target=self._rate_report_loop, daemon=True).start()
-        threading.Thread(target=self._heartbeat_loop, daemon=True).start()
         
+        # Start retry thread for exactly-once
         if self.exactly_once:
             threading.Thread(target=self._retry_loop, daemon=True).start()
         
-        # Main server loop
+        # Main loop
         self._server_loop()
-        
-        # Cleanup
-        self._cleanup()
     
     def stop(self):
-        """Signal the task to stop."""
-        self.shutdown_requested = True
+        """Stop the task."""
         self.running = False
-    
-    def _cleanup(self):
-        """Cleanup after task stops."""
-        self.logger.log(f"TASK CLEANUP: processed {self.tuples_processed} tuples")
         
-        # Flush output if this is the final stage
-        if self.stage == self.num_stages - 1:
-            self._flush_output_to_hydfs()
-        
-        # Flush exactly-once state
         if self.eo_tracker:
             self.eo_tracker.flush()
         
-        # Close socket
         if self.server_socket:
-            try:
-                self.server_socket.close()
-            except:
-                pass
+            self.server_socket.close()
         
-        # Notify leader
         self._notify_leader_completed()
         
         self.logger.log("TASK END")
     
     def _get_config_from_leader(self):
         """Get task configuration from leader."""
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                msg = {'type': 'GET_TASK_CONFIG', 'task_id': self.task_id}
-                response = self._send_to_leader(msg)
+        try:
+            msg = {'type': 'GET_TASK_CONFIG', 'task_id': self.task_id}
+            response = self._send_to_leader(msg)
+            
+            if response and response.get('status') == 'success':
+                self.config = response
+                self.successor_tasks = response.get('successor_tasks', [])
+                self.hydfs_dest = response.get('hydfs_dest', '')
+                self.num_stages = response.get('num_stages', 1)
                 
-                if response and response.get('status') == 'success':
-                    self.config = response
-                    self.successor_tasks = response.get('successor_tasks', [])
-                    self.hydfs_dest = response.get('hydfs_dest', '')
-                    self.num_stages = response.get('num_stages', 1)
-                    self.expected_eof = response.get('predecessor_count', 1)
-                    
-                    self.logger.log(f"CONFIG: successors={len(self.successor_tasks)} "
-                                  f"dest={self.hydfs_dest} num_stages={self.num_stages} "
-                                  f"expected_eof={self.expected_eof}")
-                    return
-            except Exception as e:
-                self.logger.log(f"CONFIG ERROR (attempt {attempt + 1}): {e}")
-                time.sleep(1)
-        
-        self.logger.log("CONFIG: Failed to get config from leader")
+                self.logger.log(f"CONFIG: successors={len(self.successor_tasks)} "
+                              f"dest={self.hydfs_dest}")
+        except Exception as e:
+            self.logger.log(f"CONFIG ERROR: {e}")
     
     def _notify_leader_started(self):
         """Notify leader that task has started."""
@@ -402,11 +258,7 @@ class RainStormTask:
     
     def _notify_leader_completed(self):
         """Notify leader that task has completed."""
-        msg = {
-            'type': 'TASK_COMPLETED',
-            'task_id': self.task_id,
-            'tuples_processed': self.tuples_processed
-        }
+        msg = {'type': 'TASK_COMPLETED', 'task_id': self.task_id}
         self._send_to_leader(msg)
     
     def _send_to_leader(self, msg: dict) -> Optional[dict]:
@@ -425,25 +277,23 @@ class RainStormTask:
     
     def _server_loop(self):
         """Main server loop to receive tuples."""
-        while self.running and not self.shutdown_requested:
+        while self.running:
             try:
                 self.server_socket.settimeout(1.0)
                 conn, addr = self.server_socket.accept()
-                # Handle in same thread to maintain ordering
-                self._handle_connection(conn, addr)
+                threading.Thread(target=self._handle_tuple,
+                               args=(conn, addr), daemon=True).start()
             except socket.timeout:
                 continue
             except Exception as e:
-                if self.running and not self.shutdown_requested:
+                if self.running:
                     self.logger.log(f"SERVER ERROR: {e}")
-                break
     
-    def _handle_connection(self, conn: socket.socket, addr: tuple):
-        """Handle incoming connection."""
+    def _handle_tuple(self, conn: socket.socket, addr: tuple):
+        """Handle incoming tuple."""
         try:
             data = conn.recv(65536).decode('utf-8')
             if not data:
-                conn.close()
                 return
             
             msg = json.loads(data)
@@ -451,22 +301,17 @@ class RainStormTask:
             
             if msg_type == 'TUPLE':
                 self._process_tuple(msg)
+                # Send ACK
                 conn.sendall(json.dumps({'status': 'ack'}).encode('utf-8'))
             elif msg_type == 'ACK':
                 self._handle_ack(msg)
             elif msg_type == 'EOF':
-                conn.sendall(json.dumps({'status': 'ack'}).encode('utf-8'))
-                conn.close()
                 self._handle_eof(msg)
-                return
-            
-            conn.close()
+                conn.sendall(json.dumps({'status': 'ack'}).encode('utf-8'))
         except Exception as e:
             self.logger.log(f"TUPLE ERROR: {e}")
-            try:
-                conn.close()
-            except:
-                pass
+        finally:
+            conn.close()
     
     def _process_tuple(self, msg: dict):
         """Process an incoming tuple."""
@@ -477,21 +322,25 @@ class RainStormTask:
         # Check for duplicates in exactly-once mode
         if self.exactly_once and self.eo_tracker:
             if self.eo_tracker.is_duplicate(tuple_id):
-                return  # Already processed, skip
+                return
         
-        # Run the operator
+        # Run operator
         output_tuples = self._run_operator(key, value)
         
-        # Mark as processed for exactly-once
+        # Mark as processed
         if self.exactly_once and self.eo_tracker:
             self.eo_tracker.mark_processed(tuple_id)
         
         self.tuples_processed += 1
         
+        # Log output
+        for out_key, out_value in output_tuples:
+            self.logger.log(f"OUTPUT: key={out_key} value={out_value}")
+        
         # Forward to next stage or output
         if self.stage == self.num_stages - 1:
-            # Last stage - buffer output for HyDFS
-            self._buffer_output(output_tuples)
+            # Last stage - write to HyDFS
+            self._write_output(output_tuples)
         else:
             # Forward to next stage
             for out_key, out_value in output_tuples:
@@ -513,7 +362,7 @@ class RainStormTask:
                 input=input_data,
                 capture_output=True,
                 text=True,
-                timeout=10.0
+                timeout=5.0
             )
             
             # Parse output
@@ -541,13 +390,9 @@ class RainStormTask:
     def _forward_tuple(self, source_tuple_id: str, key: str, value: str):
         """Forward tuple to next stage."""
         if not self.successor_tasks:
-            # Refresh successor list from leader
-            self._refresh_successors()
-            if not self.successor_tasks:
-                self.logger.log("WARNING: No successor tasks available")
-                return
+            return
         
-        # Hash partition to select target task
+        # Hash partition
         target_idx = hash(key) % len(self.successor_tasks)
         target = self.successor_tasks[target_idx]
         
@@ -573,18 +418,6 @@ class RainStormTask:
         
         self._send_tuple_to_task(target, tuple_msg)
     
-    def _refresh_successors(self):
-        """Refresh successor task list from leader."""
-        try:
-            response = self._send_to_leader({
-                'type': 'GET_SUCCESSOR_TASKS',
-                'stage': self.stage
-            })
-            if response and response.get('status') == 'success':
-                self.successor_tasks = response.get('successor_tasks', [])
-        except Exception as e:
-            self.logger.log(f"REFRESH SUCCESSORS ERROR: {e}")
-    
     def _send_tuple_to_task(self, target: dict, msg: dict) -> bool:
         """Send tuple to a task."""
         try:
@@ -597,7 +430,7 @@ class RainStormTask:
             response = sock.recv(1024).decode('utf-8')
             sock.close()
             
-            if 'ack' in response.lower():
+            if 'ack' in response:
                 # Mark as acked
                 output_id = msg.get('tuple_id')
                 if self.exactly_once and self.eo_tracker:
@@ -612,21 +445,6 @@ class RainStormTask:
         except Exception as e:
             return False
     
-    def _send_eof_to_task(self, target: dict) -> bool:
-        """Send EOF to a task."""
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5.0)
-            sock.connect((target['hostname'], target['port']))
-            eof_msg = {'type': 'EOF', 'source_task': self.task_id}
-            sock.sendall(json.dumps(eof_msg).encode('utf-8'))
-            response = sock.recv(1024)
-            sock.close()
-            return True
-        except Exception as e:
-            self.logger.log(f"EOF SEND ERROR to {target}: {e}")
-            return False
-    
     def _handle_ack(self, msg: dict):
         """Handle ACK from next stage."""
         output_id = msg.get('output_id')
@@ -639,103 +457,40 @@ class RainStormTask:
                 del self.pending_outputs[output_id]
     
     def _handle_eof(self, msg: dict):
-        """Handle EOF signal from predecessor."""
+        """Handle EOF signal."""
         self.eof_received += 1
-        source_task = msg.get('source_task', 'unknown')
+        self.logger.log(f"EOF received ({self.eof_received})")
         
-        self.logger.log(f"EOF received from {source_task} ({self.eof_received}/{self.expected_eof})")
-        
-        # Only proceed when we've received EOF from all predecessors
-        if self.eof_received < self.expected_eof:
-            return
-        
-        self.logger.log(f"All EOFs received, processing completion")
-        
-        # Wait for pending outputs if exactly-once
-        if self.exactly_once:
-            max_wait = 10.0
-            wait_start = time.time()
-            while time.time() - wait_start < max_wait:
-                with self.pending_lock:
-                    if not self.pending_outputs:
-                        break
-                time.sleep(0.1)
-            
-            with self.pending_lock:
-                if self.pending_outputs:
-                    self.logger.log(f"WARNING: {len(self.pending_outputs)} pending outputs not acked")
-        
-        # Forward EOF to successor tasks
+        # Forward EOF if all inputs received
         if self.successor_tasks:
-            self.logger.log(f"Forwarding EOF to {len(self.successor_tasks)} successors")
             for target in self.successor_tasks:
-                self._send_eof_to_task(target)
+                eof_msg = {'type': 'EOF', 'source_task': self.task_id}
+                self._send_tuple_to_task(target, eof_msg)
         
-        self.logger.log(f"EOF processed, stopping task (processed {self.tuples_processed} tuples)")
-        
-        # Signal shutdown
-        self.stop()
+        # Flush and stop if done
+        if self.eo_tracker:
+            self.eo_tracker.flush()
     
-    def _buffer_output(self, tuples: List[tuple]):
-        """Buffer output tuples and flush when batch is full."""
+    def _write_output(self, tuples: List[tuple]):
+        """Write output tuples to local file (can be collected to HyDFS later)."""
         if not tuples:
             return
         
-        with self.output_buffer_lock:
+        # Write to local output file
+        output_file = f"output_{self.task_id}.txt"
+        with open(output_file, 'a') as f:
             for key, value in tuples:
-                output_line = f"{key}\t{value}"
-                self.output_buffer.append(output_line)
-                
-                # Print to console continuously as required by spec
-                print(f"OUTPUT: {output_line}")
-            
-            # Flush to HyDFS if buffer is full
-            if len(self.output_buffer) >= self.output_batch_size:
-                self._flush_output_to_hydfs()
-    
-    def _flush_output_to_hydfs(self):
-        """Flush buffered output to HyDFS destination file via leader."""
-        with self.output_buffer_lock:
-            if not self.output_buffer:
-                return
-            
-            if not self.hydfs_dest:
-                self.logger.log("WARNING: No HyDFS destination configured")
-                self.output_buffer.clear()
-                return
-            
-            try:
-                # Send output data to leader for HyDFS append
-                output_data = "\n".join(self.output_buffer) + "\n"
-                
-                msg = {
-                    'type': 'APPEND_OUTPUT',
-                    'hydfs_dest': self.hydfs_dest,
-                    'data': list(output_data.encode('utf-8')),
-                    'task_id': self.task_id,
-                    'run_id': self.run_id
-                }
-                
-                response = self._send_to_leader(msg)
-                
-                if response and response.get('status') == 'success':
-                    self.logger.log(f"HYDFS FLUSH: {len(self.output_buffer)} lines to {self.hydfs_dest}")
-                else:
-                    self.logger.log(f"HYDFS FLUSH ERROR: {response}")
-                
-                self.output_buffer.clear()
-                
-            except Exception as e:
-                self.logger.log(f"HYDFS FLUSH ERROR: {e}")
+                f.write(f"{key}\t{value}\n")
+        
+        # Also print to console
+        for key, value in tuples:
+            print(f"OUTPUT: {key}\t{value}")
     
     def _rate_report_loop(self):
-        """Report processing rate to leader periodically."""
-        while self.running and not self.shutdown_requested:
+        """Report rate to leader every second."""
+        while self.running:
             try:
-                time.sleep(RATE_REPORT_INTERVAL)
-                
-                if self.shutdown_requested:
-                    break
+                time.sleep(1.0)
                 
                 now = time.time()
                 elapsed = now - self.last_rate_time
@@ -757,49 +512,19 @@ class RainStormTask:
             except Exception as e:
                 pass
     
-    def _heartbeat_loop(self):
-        """Send heartbeats to leader for failure detection."""
-        while self.running and not self.shutdown_requested:
-            try:
-                time.sleep(HEARTBEAT_INTERVAL)
-                
-                if self.shutdown_requested:
-                    break
-                
-                msg = {
-                    'type': 'TASK_HEARTBEAT',
-                    'task_id': self.task_id
-                }
-                self._send_to_leader(msg)
-                
-            except Exception as e:
-                pass
-    
     def _retry_loop(self):
-        """Retry pending outputs for exactly-once semantics."""
-        while self.running and not self.shutdown_requested:
+        """Retry pending outputs for exactly-once."""
+        while self.running:
             try:
                 time.sleep(2.0)
-                
-                if self.shutdown_requested:
-                    break
                 
                 with self.pending_lock:
                     now = time.time()
                     for output_id, info in list(self.pending_outputs.items()):
-                        # Retry if older than 5 seconds and haven't exceeded retries
+                        # Retry if older than 5 seconds
                         if now - info['time'] > 5.0 and info['retries'] < 3:
                             info['retries'] += 1
                             info['time'] = now
-                            self.logger.log(f"RETRY: {output_id} (attempt {info['retries']})")
-                            
-                            # Refresh target in case of autoscaling
-                            self._refresh_successors()
-                            if self.successor_tasks:
-                                key = info['tuple'].get('key', '')
-                                target_idx = hash(key) % len(self.successor_tasks)
-                                info['target'] = self.successor_tasks[target_idx]
-                            
                             self._send_tuple_to_task(info['target'], info['tuple'])
                             
             except Exception as e:
@@ -807,19 +532,17 @@ class RainStormTask:
 
 
 def main():
-    """Main entry point for task process."""
     parser = argparse.ArgumentParser(description='RainStorm Task')
-    parser.add_argument('--task-id', required=True, help='Task ID')
-    parser.add_argument('--stage', type=int, required=True, help='Stage number')
-    parser.add_argument('--task-idx', type=int, required=True, help='Task index within stage')
-    parser.add_argument('--port', type=int, required=True, help='Port to listen on')
-    parser.add_argument('--op-exe', required=True, help='Operator executable')
-    parser.add_argument('--op-args', default='', help='Operator arguments')
-    parser.add_argument('--leader-host', required=True, help='Leader hostname')
-    parser.add_argument('--run-id', required=True, help='Run ID')
-    parser.add_argument('--vm-id', type=int, required=True, help='VM ID')
-    parser.add_argument('--exactly-once', action='store_true', help='Enable exactly-once')
-    parser.add_argument('--stateful', action='store_true', help='Stateful operator')
+    parser.add_argument('--task-id', required=True)
+    parser.add_argument('--stage', type=int, required=True)
+    parser.add_argument('--task-idx', type=int, required=True)
+    parser.add_argument('--port', type=int, required=True)
+    parser.add_argument('--op-exe', required=True)
+    parser.add_argument('--op-args', default='')
+    parser.add_argument('--leader-host', required=True)
+    parser.add_argument('--run-id', required=True)
+    parser.add_argument('--vm-id', type=int, required=True)
+    parser.add_argument('--exactly-once', action='store_true')
     
     args = parser.parse_args()
     
@@ -833,18 +556,15 @@ def main():
         leader_host=args.leader_host,
         run_id=args.run_id,
         vm_id=args.vm_id,
-        exactly_once=args.exactly_once,
-        is_stateful=args.stateful
+        exactly_once=args.exactly_once
     )
     
     try:
         task.start()
     except KeyboardInterrupt:
         pass
-    except Exception as e:
-        print(f"Task error: {e}")
-        import traceback
-        traceback.print_exc()
+    finally:
+        task.stop()
 
 
 if __name__ == '__main__':
