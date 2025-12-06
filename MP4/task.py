@@ -223,7 +223,10 @@ class RainStormTask:
             self.eo_tracker.flush()
         
         if self.server_socket:
-            self.server_socket.close()
+            try:
+                self.server_socket.close()
+            except:
+                pass
         
         self._notify_leader_completed()
         
@@ -288,6 +291,7 @@ class RainStormTask:
             except Exception as e:
                 if self.running:
                     self.logger.log(f"SERVER ERROR: {e}")
+                break
     
     def _handle_tuple(self, conn: socket.socket, addr: tuple):
         """Handle incoming tuple."""
@@ -306,12 +310,17 @@ class RainStormTask:
             elif msg_type == 'ACK':
                 self._handle_ack(msg)
             elif msg_type == 'EOF':
-                self._handle_eof(msg)
                 conn.sendall(json.dumps({'status': 'ack'}).encode('utf-8'))
+                conn.close()
+                self._handle_eof(msg)
+                return
         except Exception as e:
             self.logger.log(f"TUPLE ERROR: {e}")
         finally:
-            conn.close()
+            try:
+                conn.close()
+            except:
+                pass
     
     def _process_tuple(self, msg: dict):
         """Process an incoming tuple."""
@@ -461,15 +470,29 @@ class RainStormTask:
         self.eof_received += 1
         self.logger.log(f"EOF received ({self.eof_received})")
         
-        # Forward EOF if all inputs received
+        # Forward EOF to successor tasks if any
         if self.successor_tasks:
             for target in self.successor_tasks:
                 eof_msg = {'type': 'EOF', 'source_task': self.task_id}
                 self._send_tuple_to_task(target, eof_msg)
         
-        # Flush and stop if done
+        # Flush exactly-once state
         if self.eo_tracker:
             self.eo_tracker.flush()
+        
+        # Wait briefly for any pending outputs to be acked (exactly-once mode)
+        if self.exactly_once:
+            max_wait = 5.0
+            wait_start = time.time()
+            while time.time() - wait_start < max_wait:
+                with self.pending_lock:
+                    if not self.pending_outputs:
+                        break
+                time.sleep(0.1)
+        
+        # Log completion and stop the task
+        self.logger.log(f"EOF processed, stopping task (processed {self.tuples_processed} tuples)")
+        self.stop()
     
     def _write_output(self, tuples: List[tuple]):
         """Write output tuples to local file (can be collected to HyDFS later)."""

@@ -100,6 +100,7 @@ class TaskInfo:
         self.tuples_processed = 0
         self.last_rate_time = time.time()
         self.last_tuple_count = 0
+        self.completed = False
     
     def to_dict(self) -> dict:
         return {
@@ -110,7 +111,8 @@ class TaskInfo:
             'pid': self.pid,
             'op_exe': self.op_exe,
             'op_args': self.op_args,
-            'log_file': self.log_file
+            'log_file': self.log_file,
+            'completed': self.completed
         }
 
 
@@ -131,6 +133,7 @@ class RainStormLeader:
         
         # Job state
         self.running = False
+        self.job_running = False
         self.job_config: Optional[dict] = None
         self.tasks: Dict[str, TaskInfo] = {}  # task_id -> TaskInfo
         self.tasks_lock = threading.Lock()
@@ -159,6 +162,9 @@ class RainStormLeader:
         # Monitoring threads
         self.monitor_thread: Optional[threading.Thread] = None
         self.rate_log_thread: Optional[threading.Thread] = None
+        
+        # Source completion tracking
+        self.source_completed = False
     
     def start(self):
         """Start the leader server."""
@@ -289,8 +295,36 @@ class RainStormLeader:
     def _handle_task_completed(self, msg: dict) -> dict:
         """Handle task completion notification."""
         task_id = msg.get('task_id')
-        self.logger.log(f"TASK END: {task_id}")
+        
+        with self.tasks_lock:
+            if task_id in self.tasks:
+                self.tasks[task_id].completed = True
+                task = self.tasks[task_id]
+                self.logger.log(f"TASK END: {task_id} on VM{task.vm_id} "
+                              f"(processed {task.tuples_processed} tuples)")
+                
+                # Remove from active tasks
+                del self.tasks[task_id]
+        
+        # Check if all tasks are done
+        self._check_job_completion()
+        
         return {'status': 'success'}
+    
+    def _check_job_completion(self):
+        """Check if all tasks have completed and end the job."""
+        with self.tasks_lock:
+            active_tasks = len(self.tasks)
+        
+        if self.source_completed and active_tasks == 0:
+            self.logger.log("RUN END: All tasks completed")
+            self.job_running = False
+            
+            # Clear job state for next job
+            self.stages.clear()
+            self.stage_tasks.clear()
+            with self.rates_lock:
+                self.task_rates.clear()
     
     def _handle_list_tasks(self) -> dict:
         """Return list of all tasks."""
@@ -397,6 +431,8 @@ class RainStormLeader:
         self.input_rate = input_rate
         self.lw = lw
         self.hw = hw
+        self.job_running = True
+        self.source_completed = False
         
         # Setup stages
         self.stages = []
@@ -480,7 +516,7 @@ class RainStormLeader:
                 self.logger.log(f"SCHEDULED: {task_id} on VM{vm_id}")
         
         # Send start commands to workers
-        for task_id, task in self.tasks.items():
+        for task_id, task in list(self.tasks.items()):
             self._start_task_on_worker(task)
     
     def _start_task_on_worker(self, task: TaskInfo):
@@ -625,14 +661,21 @@ class RainStormLeader:
                 time.sleep(interval)
             
             # Send EOF to all stage 0 tasks
+            self.logger.log("SOURCE: Sending EOF to all stage 0 tasks")
             for target in stage0_tasks:
                 eof_msg = {'type': 'EOF', 'source_task': 'source'}
                 self._send_tuple(target['hostname'], target['port'], eof_msg)
             
-            self.logger.log("SOURCE: Finished sending all tuples")
+            self.source_completed = True
+            self.logger.log("SOURCE: Finished sending all tuples and EOF signals")
+            
+            # Check if job is complete (in case tasks finished before source)
+            self._check_job_completion()
             
         except Exception as e:
             self.logger.log(f"SOURCE ERROR: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _send_tuple(self, hostname: str, port: int, msg: dict):
         """Send a tuple to a task."""
@@ -641,21 +684,24 @@ class RainStormLeader:
             sock.settimeout(5.0)
             sock.connect((hostname, port))
             sock.sendall(json.dumps(msg).encode('utf-8'))
+            # Wait for ack
+            response = sock.recv(1024)
             sock.close()
         except Exception as e:
             pass  # Silently ignore tuple send failures
     
     def _monitor_loop(self):
         """Monitor tasks for failures and autoscaling."""
-        while self.running:
+        while self.running and self.job_running:
             try:
                 time.sleep(1.0)
                 
-                # Check for failed tasks
-                self._check_task_failures()
+                # Check for failed tasks (only if job is still running)
+                if self.job_running:
+                    self._check_task_failures()
                 
                 # Autoscaling
-                if self.autoscale_enabled:
+                if self.autoscale_enabled and self.job_running:
                     self._check_autoscaling()
                     
             except Exception as e:
@@ -665,15 +711,19 @@ class RainStormLeader:
         """Check for failed tasks and restart them."""
         with self.tasks_lock:
             for task_id, task in list(self.tasks.items()):
-                if task.pid > 0:
+                if task.pid > 0 and not task.completed:
                     # Check if task is still running
                     hostname = VM_HOSTS[task.vm_id]
                     msg = {'type': 'CHECK_TASK', 'pid': task.pid}
                     response = self._send_to_worker(hostname, msg, timeout=2.0)
                     
                     if response and not response.get('running', True):
-                        self.logger.log(f"TASK FAILURE DETECTED: {task_id}")
-                        self._restart_task(task)
+                        # Task exited - could be completion or failure
+                        # Check if it was a normal completion (task will send TASK_COMPLETED)
+                        # If we get here and task is not marked complete, it's a failure
+                        if not task.completed:
+                            self.logger.log(f"TASK FAILURE DETECTED: {task_id}")
+                            self._restart_task(task)
     
     def _restart_task(self, task: TaskInfo):
         """Restart a failed task."""
@@ -768,7 +818,7 @@ class RainStormLeader:
     
     def _rate_log_loop(self):
         """Log rates every second."""
-        while self.running:
+        while self.running and self.job_running:
             try:
                 time.sleep(1.0)
                 
