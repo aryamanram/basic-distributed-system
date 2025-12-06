@@ -2,6 +2,11 @@
 """
 RainStorm - Stream Processing Framework
 Main entry point and Leader coordination
+
+Usage:
+  Terminal 1 (VM1): python3 rainstorm.py --vm-id 1 --leader
+  Terminal 2-10:    python3 rainstorm.py --vm-id N
+  Terminal on VM1:  python3 rainstorm.py --submit --nstages 2 --ntasks 3 ...
 """
 import argparse
 import json
@@ -215,12 +220,40 @@ class RainStormLeader:
                 response = self._handle_kill_task(msg)
             elif msg_type == 'GET_TASK_CONFIG':
                 response = self._handle_get_task_config(msg)
+            elif msg_type == 'SUBMIT_JOB':
+                response = self._handle_submit_job(msg)
+            elif msg_type == 'GET_WORKERS':
+                response = self._handle_get_workers()
             
             conn.sendall(json.dumps(response).encode('utf-8'))
         except Exception as e:
             self.logger.log(f"LEADER ERROR handling connection: {e}")
         finally:
             conn.close()
+    
+    def _handle_submit_job(self, msg: dict) -> dict:
+        """Handle job submission from CLI."""
+        try:
+            self.start_job(
+                nstages=msg.get('nstages'),
+                ntasks_per_stage=msg.get('ntasks'),
+                operators=msg.get('operators'),
+                hydfs_src=msg.get('src'),
+                hydfs_dest=msg.get('dest'),
+                exactly_once=msg.get('exactly_once', False),
+                autoscale_enabled=msg.get('autoscale', False),
+                input_rate=msg.get('input_rate', 100),
+                lw=msg.get('lw', 50),
+                hw=msg.get('hw', 150)
+            )
+            return {'status': 'success', 'message': 'Job submitted'}
+        except Exception as e:
+            return {'status': 'error', 'message': str(e)}
+    
+    def _handle_get_workers(self) -> dict:
+        """Return list of available workers."""
+        workers = self._get_available_workers()
+        return {'status': 'success', 'workers': workers}
     
     def _handle_rate_update(self, msg: dict) -> dict:
         """Handle rate update from a task."""
@@ -375,10 +408,11 @@ class RainStormLeader:
             })
             self.stage_tasks[i] = []
         
-        # Get available workers
+        # Get available workers (should already be joined)
         workers = self._get_available_workers()
-        if len(workers) < 2:
-            self.logger.log("ERROR: Not enough workers available")
+        
+        if len(workers) < 1:
+            self.logger.log("ERROR: No workers available. Make sure workers have joined.")
             return
         
         self.logger.log(f"Available workers: {workers}")
@@ -396,7 +430,7 @@ class RainStormLeader:
         # Start the source on the leader
         self._start_source(hydfs_src)
     
-    def _get_available_workers(self) -> List[int]:
+    def _get_available_workers(self, include_leader: bool = True) -> List[int]:
         """Get list of available worker VM IDs."""
         workers = []
         members = self.hydfs_node.membership.membership.get_members()
@@ -404,8 +438,11 @@ class RainStormLeader:
         for hostname, info in members.items():
             if info['status'] == MemberStatus.ACTIVE.value:
                 vm_id = get_vm_id_from_hostname(hostname)
-                if vm_id != self.vm_id:  # Exclude leader
-                    workers.append(vm_id)
+                workers.append(vm_id)
+        
+        # If no other workers found, at least include the leader
+        if not workers:
+            workers = [self.vm_id]
         
         return sorted(workers)
     
@@ -450,6 +487,11 @@ class RainStormLeader:
         """Start a task on its assigned worker."""
         hostname = VM_HOSTS[task.vm_id]
         
+        # If task is on leader, start it locally
+        if task.vm_id == self.vm_id:
+            self._start_task_locally(task)
+            return
+        
         msg = {
             'type': 'START_TASK',
             'task_id': task.task_id,
@@ -467,6 +509,41 @@ class RainStormLeader:
             self.logger.log(f"TASK STARTED: {task.task_id} on VM{task.vm_id}")
         else:
             self.logger.log(f"TASK START FAILED: {task.task_id}")
+    
+    def _start_task_locally(self, task: TaskInfo):
+        """Start a task locally on the leader."""
+        import subprocess
+        
+        task_port = TASK_BASE_PORT + task.task_idx
+        log_file = f"task_{task.task_id}_{self.run_id}.log"
+        
+        cmd = [
+            sys.executable, 'task.py',
+            '--task-id', task.task_id,
+            '--stage', str(task.stage),
+            '--task-idx', str(task.task_idx),
+            '--port', str(task_port),
+            '--op-exe', task.op_exe,
+            '--op-args', task.op_args,
+            '--leader-host', self.hostname,
+            '--run-id', self.run_id,
+            '--vm-id', str(self.vm_id)
+        ]
+        
+        if self.exactly_once:
+            cmd.append('--exactly-once')
+        
+        process = subprocess.Popen(
+            cmd,
+            stdout=open(log_file, 'w'),
+            stderr=subprocess.STDOUT,
+            cwd=os.path.dirname(os.path.abspath(__file__))
+        )
+        
+        task.pid = process.pid
+        task.log_file = log_file
+        
+        self.logger.log(f"TASK STARTED LOCAL: {task.task_id} PID={process.pid}")
     
     def _start_source(self, hydfs_src: str):
         """Start the source process to read from HyDFS."""
@@ -844,17 +921,62 @@ class RainStormWorker:
             return {'status': 'success', 'running': False}
 
 
+def submit_job(args):
+    """Submit a job to the leader from a separate terminal."""
+    # Parse operators
+    operators = []
+    for op in args.operators:
+        parts = op.split(':')
+        op_exe = parts[0]
+        op_args = parts[1] if len(parts) > 1 else ''
+        operators.append((op_exe, op_args))
+    
+    msg = {
+        'type': 'SUBMIT_JOB',
+        'nstages': args.nstages,
+        'ntasks': args.ntasks or 3,
+        'operators': operators,
+        'src': args.src or '',
+        'dest': args.dest or '',
+        'exactly_once': args.exactly_once,
+        'autoscale': args.autoscale,
+        'input_rate': args.input_rate,
+        'lw': args.lw,
+        'hw': args.hw
+    }
+    
+    leader_host = VM_HOSTS.get(args.leader_vm, VM_HOSTS[1])
+    
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(10.0)
+        sock.connect((leader_host, RAINSTORM_PORT))
+        sock.sendall(json.dumps(msg).encode('utf-8'))
+        response = sock.recv(65536).decode('utf-8')
+        sock.close()
+        
+        result = json.loads(response)
+        if result.get('status') == 'success':
+            print(f"Job submitted successfully to {leader_host}")
+        else:
+            print(f"Job submission failed: {result.get('message')}")
+    except Exception as e:
+        print(f"Error submitting job: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(description='RainStorm Stream Processing')
-    parser.add_argument('--vm-id', type=int, required=True, help='VM ID (1-10)')
+    parser.add_argument('--vm-id', type=int, help='VM ID (1-10)')
     parser.add_argument('--leader', action='store_true', help='Run as leader')
+    parser.add_argument('--submit', action='store_true', help='Submit job to leader')
+    parser.add_argument('--leader-vm', type=int, default=1, help='Leader VM ID for job submission')
     
-    # Job parameters (only for leader)
+    # Job parameters
     parser.add_argument('--nstages', type=int, help='Number of stages')
     parser.add_argument('--ntasks', type=int, help='Number of tasks per stage')
     parser.add_argument('--operators', nargs='+', help='op_exe:op_args pairs')
-    parser.add_argument('--src', type=str, help='HyDFS source file')
-    parser.add_argument('--dest', type=str, help='HyDFS destination file')
+    parser.add_argument('--src', type=str, help='Source file')
+    parser.add_argument('--dest', type=str, help='Destination file')
     parser.add_argument('--exactly-once', action='store_true')
     parser.add_argument('--autoscale', action='store_true')
     parser.add_argument('--input-rate', type=int, default=100)
@@ -862,6 +984,19 @@ def main():
     parser.add_argument('--hw', type=int, default=150)
     
     args = parser.parse_args()
+    
+    # Submit mode - just send job to leader and exit
+    if args.submit:
+        if not args.nstages or not args.operators:
+            print("Error: --submit requires --nstages and --operators")
+            sys.exit(1)
+        submit_job(args)
+        return
+    
+    # Node mode - requires vm-id
+    if args.vm_id is None:
+        print("Error: --vm-id required for leader/worker mode")
+        sys.exit(1)
     
     # Start HyDFS node
     hydfs_node = HyDFSNode(args.vm_id)
@@ -875,30 +1010,11 @@ def main():
         leader = RainStormLeader(args.vm_id, hydfs_node)
         leader.start()
         
-        if args.nstages and args.operators:
-            # Parse operators
-            operators = []
-            for op in args.operators:
-                parts = op.split(':')
-                op_exe = parts[0]
-                op_args = parts[1] if len(parts) > 1 else ''
-                operators.append((op_exe, op_args))
-            
-            # Start job
-            leader.start_job(
-                nstages=args.nstages,
-                ntasks_per_stage=args.ntasks or 3,
-                operators=operators,
-                hydfs_src=args.src or '',
-                hydfs_dest=args.dest or '',
-                exactly_once=args.exactly_once,
-                autoscale_enabled=args.autoscale,
-                input_rate=args.input_rate,
-                lw=args.lw,
-                hw=args.hw
-            )
+        print("Leader running. Waiting for job submissions...")
+        print("Submit jobs from another terminal using:")
+        print("  python3 rainstorm.py --submit --nstages N --ntasks M --operators ... --src FILE --dest FILE")
+        print("Press Ctrl+C to stop.")
         
-        print("Leader running. Press Ctrl+C to stop.")
         try:
             while True:
                 time.sleep(1)
