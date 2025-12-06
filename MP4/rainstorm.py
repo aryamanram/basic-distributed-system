@@ -22,17 +22,17 @@ from typing import Dict, List, Optional, Set, Tuple
 _parent_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
 sys.path.insert(0, _parent_dir)
 
-# Also add MP3 directory itself so its internal imports work
 _mp3_dir = os.path.join(_parent_dir, 'MP3')
 sys.path.insert(0, _mp3_dir)
 
-# Also add MP2 directory
 _mp2_dir = os.path.join(_parent_dir, 'MP2')
 sys.path.insert(0, _mp2_dir)
 
 from membership import MembershipService, MemberStatus
 from node import HyDFSNode
 from main import HyDFSClient
+from storage import FileBlock
+from utils import get_file_id
 
 # Ports
 RAINSTORM_PORT = 8000
@@ -119,7 +119,6 @@ class TaskInfo:
 class RainStormLeader:
     """
     RainStorm Leader - coordinates stream processing jobs.
-    Handles scheduling, monitoring, autoscaling, and failure recovery.
     """
     
     def __init__(self, vm_id: int, hydfs_node: HyDFSNode):
@@ -135,22 +134,22 @@ class RainStormLeader:
         self.running = False
         self.job_running = False
         self.job_config: Optional[dict] = None
-        self.tasks: Dict[str, TaskInfo] = {}  # task_id -> TaskInfo
+        self.tasks: Dict[str, TaskInfo] = {}
         self.tasks_lock = threading.Lock()
         
         # Stage configuration
-        self.stages: List[dict] = []  # [{op_exe, op_args, num_tasks}]
-        self.stage_tasks: Dict[int, List[str]] = {}  # stage -> [task_ids]
+        self.stages: List[dict] = []
+        self.stage_tasks: Dict[int, List[str]] = {}
         
-        # Rate monitoring for autoscaling
-        self.task_rates: Dict[str, float] = {}  # task_id -> tuples/sec
+        # Rate monitoring
+        self.task_rates: Dict[str, float] = {}
         self.rates_lock = threading.Lock()
         
         # Autoscaling config
         self.autoscale_enabled = False
         self.input_rate = 0
-        self.lw = 0  # Low watermark
-        self.hw = 0  # High watermark
+        self.lw = 0
+        self.hw = 0
         
         # Exactly-once
         self.exactly_once = False
@@ -163,14 +162,18 @@ class RainStormLeader:
         self.monitor_thread: Optional[threading.Thread] = None
         self.rate_log_thread: Optional[threading.Thread] = None
         
-        # Source completion tracking
+        # Source completion
         self.source_completed = False
+        
+        # Output handling
+        self.hydfs_dest: str = ''
+        self.output_lock = threading.Lock()
+        self.output_sequence = 0
     
     def start(self):
         """Start the leader server."""
         self.running = True
         
-        # Start server for receiving messages
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_socket.bind(('', RAINSTORM_PORT))
@@ -189,7 +192,7 @@ class RainStormLeader:
         self.logger.log("LEADER: Stopped")
     
     def _server_loop(self):
-        """Main server loop to accept connections."""
+        """Main server loop."""
         while self.running:
             try:
                 self.server_socket.settimeout(1.0)
@@ -230,6 +233,8 @@ class RainStormLeader:
                 response = self._handle_submit_job(msg)
             elif msg_type == 'GET_WORKERS':
                 response = self._handle_get_workers()
+            elif msg_type == 'APPEND_OUTPUT':
+                response = self._handle_append_output(msg)
             
             conn.sendall(json.dumps(response).encode('utf-8'))
         except Exception as e:
@@ -238,7 +243,7 @@ class RainStormLeader:
             conn.close()
     
     def _handle_submit_job(self, msg: dict) -> dict:
-        """Handle job submission from CLI."""
+        """Handle job submission."""
         try:
             self.start_job(
                 nstages=msg.get('nstages'),
@@ -254,6 +259,8 @@ class RainStormLeader:
             )
             return {'status': 'success', 'message': 'Job submitted'}
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             return {'status': 'error', 'message': str(e)}
     
     def _handle_get_workers(self) -> dict:
@@ -295,36 +302,91 @@ class RainStormLeader:
     def _handle_task_completed(self, msg: dict) -> dict:
         """Handle task completion notification."""
         task_id = msg.get('task_id')
+        tuples_processed = msg.get('tuples_processed', 0)
         
         with self.tasks_lock:
             if task_id in self.tasks:
                 self.tasks[task_id].completed = True
+                self.tasks[task_id].tuples_processed = tuples_processed
                 task = self.tasks[task_id]
                 self.logger.log(f"TASK END: {task_id} on VM{task.vm_id} "
-                              f"(processed {task.tuples_processed} tuples)")
-                
-                # Remove from active tasks
+                              f"(processed {tuples_processed} tuples)")
                 del self.tasks[task_id]
         
-        # Check if all tasks are done
         self._check_job_completion()
         
         return {'status': 'success'}
     
+    def _handle_append_output(self, msg: dict) -> dict:
+        """Handle output append request from a task."""
+        hydfs_dest = msg.get('hydfs_dest')
+        data = bytes(msg.get('data', []))
+        task_id = msg.get('task_id')
+        run_id = msg.get('run_id')
+        
+        with self.output_lock:
+            try:
+                self.output_sequence += 1
+                
+                block = FileBlock(
+                    block_id=f"{get_file_id(hydfs_dest)}_{task_id}_{self.output_sequence}",
+                    client_id=f"rainstorm_{run_id}",
+                    sequence_num=self.output_sequence,
+                    timestamp=time.time(),
+                    data=data,
+                    size=len(data)
+                )
+                
+                replicas = self.hydfs_node.get_replicas_for_file(hydfs_dest)
+                
+                if not replicas:
+                    return {'status': 'error', 'message': 'No replicas available'}
+                
+                hostname = replicas[0].split(':')[0]
+                port = int(replicas[0].split(':')[1])
+                
+                append_msg = {
+                    'type': 'APPEND',
+                    'filename': hydfs_dest,
+                    'client_id': f"rainstorm_{run_id}",
+                    'block': {
+                        'block_id': block.block_id,
+                        'client_id': block.client_id,
+                        'sequence_num': block.sequence_num,
+                        'timestamp': block.timestamp,
+                        'data': list(block.data),
+                        'size': block.size
+                    }
+                }
+                
+                response = self.hydfs_node.network.send_message(hostname, port, append_msg)
+                
+                if response and response.get('status') == 'success':
+                    self.logger.log(f"OUTPUT APPEND: {len(data)} bytes to {hydfs_dest} from {task_id}")
+                    return {'status': 'success'}
+                else:
+                    return {'status': 'error', 'message': response.get('message') if response else 'No response'}
+                    
+            except Exception as e:
+                self.logger.log(f"OUTPUT APPEND ERROR: {e}")
+                return {'status': 'error', 'message': str(e)}
+    
     def _check_job_completion(self):
-        """Check if all tasks have completed and end the job."""
+        """Check if all tasks have completed."""
         with self.tasks_lock:
             active_tasks = len(self.tasks)
         
         if self.source_completed and active_tasks == 0:
-            self.logger.log("RUN END: All tasks completed")
+            self.logger.log(f"RUN END: All tasks completed. Output written to {self.hydfs_dest}")
             self.job_running = False
             
-            # Clear job state for next job
             self.stages.clear()
             self.stage_tasks.clear()
             with self.rates_lock:
                 self.task_rates.clear()
+            
+            with self.output_lock:
+                self.output_sequence = 0
     
     def _handle_list_tasks(self) -> dict:
         """Return list of all tasks."""
@@ -337,7 +399,6 @@ class RainStormLeader:
         vm_id = msg.get('vm_id')
         pid = msg.get('pid')
         
-        # Send kill command to the worker
         hostname = VM_HOSTS.get(vm_id)
         if not hostname:
             return {'status': 'error', 'message': 'Invalid VM ID'}
@@ -364,7 +425,6 @@ class RainStormLeader:
             task = self.tasks[task_id]
             stage = task.stage
         
-        # Build task configuration
         config = {
             'status': 'success',
             'task_id': task_id,
@@ -373,12 +433,11 @@ class RainStormLeader:
             'op_exe': task.op_exe,
             'op_args': task.op_args,
             'exactly_once': self.exactly_once,
-            'hydfs_dest': self.job_config.get('hydfs_dest') if self.job_config else '',
+            'hydfs_dest': self.hydfs_dest,
             'num_stages': len(self.stages),
             'input_rate': self.input_rate
         }
         
-        # Add successor task info
         if stage < len(self.stages) - 1:
             next_stage = stage + 1
             config['successor_tasks'] = []
@@ -409,11 +468,57 @@ class RainStormLeader:
             self.logger.log(f"LEADER ERROR sending to {hostname}: {e}")
             return None
     
+    def _create_output_file(self, hydfs_dest: str):
+        """Create the output file in HyDFS."""
+        self.logger.log(f"OUTPUT: Creating/resetting output file {hydfs_dest}")
+        
+        try:
+            replicas = self.hydfs_node.get_replicas_for_file(hydfs_dest)
+            
+            if not replicas:
+                self.logger.log("OUTPUT ERROR: No replicas available for output file")
+                return False
+            
+            initial_data = b""
+            
+            for node_id in replicas:
+                try:
+                    hostname = node_id.split(':')[0]
+                    port = int(node_id.split(':')[1])
+                    
+                    # Try to delete existing file
+                    delete_msg = {'type': 'DELETE', 'filename': hydfs_dest}
+                    self.hydfs_node.network.send_message(hostname, port, delete_msg, timeout=5.0)
+                    
+                    # Create new file
+                    create_msg = {
+                        'type': 'CREATE',
+                        'filename': hydfs_dest,
+                        'data': list(initial_data)
+                    }
+                    response = self.hydfs_node.network.send_message(hostname, port, create_msg)
+                    
+                    if response and response.get('status') == 'success':
+                        self.logger.log(f"OUTPUT: Created on {hostname}")
+                        
+                except Exception as e:
+                    self.logger.log(f"OUTPUT ERROR creating on {node_id}: {e}")
+            
+            return True
+            
+        except Exception as e:
+            self.logger.log(f"OUTPUT ERROR: {e}")
+            return False
+    
     def start_job(self, nstages: int, ntasks_per_stage: int, 
                   operators: List[Tuple[str, str]], hydfs_src: str, 
                   hydfs_dest: str, exactly_once: bool, autoscale_enabled: bool,
                   input_rate: int = 100, lw: int = 50, hw: int = 150):
         """Start a RainStorm job."""
+        
+        self.run_id = f"{int(time.time())}"
+        self.logger = RainStormLogger(self.vm_id, self.run_id, is_leader=True)
+        
         self.logger.log(f"RUN START: stages={nstages} tasks_per_stage={ntasks_per_stage}")
         self.logger.log(f"  src={hydfs_src} dest={hydfs_dest}")
         self.logger.log(f"  exactly_once={exactly_once} autoscale={autoscale_enabled}")
@@ -433,6 +538,13 @@ class RainStormLeader:
         self.hw = hw
         self.job_running = True
         self.source_completed = False
+        self.hydfs_dest = hydfs_dest
+        
+        with self.output_lock:
+            self.output_sequence = 0
+        
+        # Create output file
+        self._create_output_file(hydfs_dest)
         
         # Setup stages
         self.stages = []
@@ -444,29 +556,25 @@ class RainStormLeader:
             })
             self.stage_tasks[i] = []
         
-        # Get available workers (should already be joined)
         workers = self._get_available_workers()
         
         if len(workers) < 1:
-            self.logger.log("ERROR: No workers available. Make sure workers have joined.")
+            self.logger.log("ERROR: No workers available.")
             return
         
         self.logger.log(f"Available workers: {workers}")
         
-        # Schedule tasks across workers
         self._schedule_tasks(workers)
         
-        # Start monitoring threads
         self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self.monitor_thread.start()
         
         self.rate_log_thread = threading.Thread(target=self._rate_log_loop, daemon=True)
         self.rate_log_thread.start()
         
-        # Start the source on the leader
         self._start_source(hydfs_src)
     
-    def _get_available_workers(self, include_leader: bool = True) -> List[int]:
+    def _get_available_workers(self) -> List[int]:
         """Get list of available worker VM IDs."""
         workers = []
         members = self.hydfs_node.membership.membership.get_members()
@@ -476,7 +584,6 @@ class RainStormLeader:
                 vm_id = get_vm_id_from_hostname(hostname)
                 workers.append(vm_id)
         
-        # If no other workers found, at least include the leader
         if not workers:
             workers = [self.vm_id]
         
@@ -515,7 +622,6 @@ class RainStormLeader:
                 
                 self.logger.log(f"SCHEDULED: {task_id} on VM{vm_id}")
         
-        # Send start commands to workers
         for task_id, task in list(self.tasks.items()):
             self._start_task_on_worker(task)
     
@@ -523,7 +629,6 @@ class RainStormLeader:
         """Start a task on its assigned worker."""
         hostname = VM_HOSTS[task.vm_id]
         
-        # If task is on leader, start it locally
         if task.vm_id == self.vm_id:
             self._start_task_locally(task)
             return
@@ -542,7 +647,6 @@ class RainStormLeader:
         
         response = self._send_to_worker(hostname, msg)
         if response and response.get('status') == 'success':
-            # Update task info with PID and log_file from worker
             task.pid = response.get('pid', 0)
             task.log_file = response.get('log_file', f"task_{task.task_id}_{self.run_id}.log")
             self.logger.log(f"TASK STARTED: {task.task_id} on VM{task.vm_id} PID={task.pid}")
@@ -585,10 +689,9 @@ class RainStormLeader:
         self.logger.log(f"TASK STARTED LOCAL: {task.task_id} PID={process.pid}")
     
     def _start_source(self, hydfs_src: str):
-        """Start the source process to read from HyDFS."""
+        """Start the source process."""
         self.logger.log(f"SOURCE START: Reading from {hydfs_src}")
         
-        # Start source in a separate thread
         source_thread = threading.Thread(
             target=self._source_loop,
             args=(hydfs_src,),
@@ -599,10 +702,8 @@ class RainStormLeader:
     def _source_loop(self, hydfs_src: str):
         """Source loop - reads from file and sends to stage 0 tasks."""
         try:
-            # Try to read from local file first
             local_path = hydfs_src
             if not os.path.exists(local_path):
-                # Try HyDFS
                 temp_file = f"/tmp/rainstorm_src_{self.run_id}.csv"
                 self.hydfs_client.get(hydfs_src, temp_file)
                 local_path = temp_file
@@ -616,7 +717,6 @@ class RainStormLeader:
             
             self.logger.log(f"SOURCE: Loaded {len(lines)} lines")
             
-            # Get stage 0 tasks
             stage0_tasks = []
             with self.tasks_lock:
                 for task_id in self.stage_tasks.get(0, []):
@@ -632,22 +732,18 @@ class RainStormLeader:
                 self.logger.log("SOURCE ERROR: No stage 0 tasks available")
                 return
             
-            # Send tuples at input_rate
             interval = 1.0 / self.input_rate if self.input_rate > 0 else 0.01
             
             for line_num, line in enumerate(lines):
                 if not self.running:
                     break
                 
-                # Create tuple
                 key = f"{hydfs_src}:{line_num}"
                 value = line.strip()
                 
-                # Hash partition to determine target task
                 task_idx = hash(key) % len(stage0_tasks)
                 target = stage0_tasks[task_idx]
                 
-                # Send tuple
                 tuple_msg = {
                     'type': 'TUPLE',
                     'tuple_id': f"{self.run_id}_{line_num}",
@@ -660,7 +756,6 @@ class RainStormLeader:
                 
                 time.sleep(interval)
             
-            # Send EOF to all stage 0 tasks
             self.logger.log("SOURCE: Sending EOF to all stage 0 tasks")
             for target in stage0_tasks:
                 eof_msg = {'type': 'EOF', 'source_task': 'source'}
@@ -669,7 +764,6 @@ class RainStormLeader:
             self.source_completed = True
             self.logger.log("SOURCE: Finished sending all tuples and EOF signals")
             
-            # Check if job is complete (in case tasks finished before source)
             self._check_job_completion()
             
         except Exception as e:
@@ -684,23 +778,20 @@ class RainStormLeader:
             sock.settimeout(5.0)
             sock.connect((hostname, port))
             sock.sendall(json.dumps(msg).encode('utf-8'))
-            # Wait for ack
             response = sock.recv(1024)
             sock.close()
         except Exception as e:
-            pass  # Silently ignore tuple send failures
+            pass
     
     def _monitor_loop(self):
-        """Monitor tasks for failures and autoscaling."""
+        """Monitor tasks for failures."""
         while self.running and self.job_running:
             try:
                 time.sleep(1.0)
                 
-                # Check for failed tasks (only if job is still running)
                 if self.job_running:
                     self._check_task_failures()
                 
-                # Autoscaling
                 if self.autoscale_enabled and self.job_running:
                     self._check_autoscaling()
                     
@@ -708,42 +799,32 @@ class RainStormLeader:
                 self.logger.log(f"MONITOR ERROR: {e}")
     
     def _check_task_failures(self):
-        """Check for failed tasks and restart them."""
+        """Check for failed tasks."""
         with self.tasks_lock:
             for task_id, task in list(self.tasks.items()):
                 if task.pid > 0 and not task.completed:
-                    # Check if task is still running
                     hostname = VM_HOSTS[task.vm_id]
                     msg = {'type': 'CHECK_TASK', 'pid': task.pid}
                     response = self._send_to_worker(hostname, msg, timeout=2.0)
                     
                     if response and not response.get('running', True):
-                        # Task exited - could be completion or failure
-                        # Check if it was a normal completion (task will send TASK_COMPLETED)
-                        # If we get here and task is not marked complete, it's a failure
                         if not task.completed:
                             self.logger.log(f"TASK FAILURE DETECTED: {task_id}")
                             self._restart_task(task)
     
     def _restart_task(self, task: TaskInfo):
         """Restart a failed task."""
-        self.logger.log(f"TASK RESTART: {task.task_id} on VM{task.vm_id} "
-                       f"op={task.op_exe} log={task.log_file}")
-        
-        # Re-start on the same VM
+        self.logger.log(f"TASK RESTART: {task.task_id} on VM{task.vm_id}")
         self._start_task_on_worker(task)
     
     def _check_autoscaling(self):
         """Check if autoscaling is needed."""
-        # Check each non-stateful stage
         for stage_idx in range(len(self.stages)):
             stage_config = self.stages[stage_idx]
             
-            # Skip stateful stages (aggregation)
-            if 'aggregate' in stage_config['op_exe'].lower():
+            if 'aggregate' in stage_config['op_exe'].lower() or 'count' in stage_config['op_exe'].lower():
                 continue
             
-            # Calculate average rate for this stage
             task_ids = self.stage_tasks.get(stage_idx, [])
             if not task_ids:
                 continue
@@ -756,7 +837,6 @@ class RainStormLeader:
             
             avg_rate = sum(rates) / len(rates)
             
-            # Check watermarks
             if avg_rate > self.hw and len(task_ids) < 10:
                 self._scale_up(stage_idx, avg_rate)
             elif avg_rate < self.lw and len(task_ids) > 1:
@@ -764,15 +844,13 @@ class RainStormLeader:
     
     def _scale_up(self, stage_idx: int, current_rate: float):
         """Add a task to a stage."""
-        self.logger.log(f"AUTOSCALE UP: stage={stage_idx} rate={current_rate:.2f} tuples/sec")
+        self.logger.log(f"AUTOSCALE UP: stage={stage_idx} rate={current_rate:.2f}")
         
         workers = self._get_available_workers()
         if not workers:
             return
         
-        # Find least loaded worker
         vm_id = workers[0]
-        
         stage_config = self.stages[stage_idx]
         task_idx = len(self.stage_tasks[stage_idx])
         task_id = f"stage{stage_idx}_task{task_idx}"
@@ -796,19 +874,17 @@ class RainStormLeader:
     
     def _scale_down(self, stage_idx: int, current_rate: float):
         """Remove a task from a stage."""
-        self.logger.log(f"AUTOSCALE DOWN: stage={stage_idx} rate={current_rate:.2f} tuples/sec")
+        self.logger.log(f"AUTOSCALE DOWN: stage={stage_idx} rate={current_rate:.2f}")
         
         task_ids = self.stage_tasks[stage_idx]
         if len(task_ids) <= 1:
             return
         
-        # Remove last task
         task_id = task_ids[-1]
         
         with self.tasks_lock:
             if task_id in self.tasks:
                 task = self.tasks[task_id]
-                # Kill the task
                 hostname = VM_HOSTS[task.vm_id]
                 kill_msg = {'type': 'KILL_PROCESS', 'pid': task.pid}
                 self._send_to_worker(hostname, kill_msg)
@@ -831,10 +907,7 @@ class RainStormLeader:
 
 
 class RainStormWorker:
-    """
-    RainStorm Worker - runs on non-leader nodes.
-    Receives commands from leader and manages local tasks.
-    """
+    """RainStorm Worker - runs on non-leader nodes."""
     
     def __init__(self, vm_id: int, hydfs_node: HyDFSNode):
         self.vm_id = vm_id
@@ -846,7 +919,7 @@ class RainStormWorker:
         
         self.running = False
         self.server_socket: Optional[socket.socket] = None
-        self.task_processes: Dict[str, int] = {}  # task_id -> pid
+        self.task_processes: Dict[str, int] = {}
     
     def start(self):
         """Start the worker server."""
@@ -908,6 +981,8 @@ class RainStormWorker:
     
     def _handle_start_task(self, msg: dict) -> dict:
         """Start a task process."""
+        import subprocess
+        
         task_id = msg.get('task_id')
         stage = msg.get('stage')
         task_idx = msg.get('task_idx')
@@ -916,9 +991,6 @@ class RainStormWorker:
         exactly_once = msg.get('exactly_once', False)
         leader_host = msg.get('leader_host')
         run_id = msg.get('run_id')
-        
-        # Start task process
-        import subprocess
         
         task_port = TASK_BASE_PORT + task_idx
         log_file = f"task_{task_id}_{run_id}.log"
@@ -975,8 +1047,7 @@ class RainStormWorker:
 
 
 def submit_job(args):
-    """Submit a job to the leader from a separate terminal."""
-    # Parse operators
+    """Submit a job to the leader."""
     operators = []
     for op in args.operators:
         parts = op.split(':')
@@ -1022,11 +1093,10 @@ def main():
     parser.add_argument('--vm-id', type=int, help='VM ID (1-10)')
     parser.add_argument('--leader', action='store_true', help='Run as leader')
     parser.add_argument('--submit', action='store_true', help='Submit job to leader')
-    parser.add_argument('--leader-vm', type=int, default=1, help='Leader VM ID for job submission')
+    parser.add_argument('--leader-vm', type=int, default=1, help='Leader VM ID')
     
-    # Job parameters
     parser.add_argument('--nstages', type=int, help='Number of stages')
-    parser.add_argument('--ntasks', type=int, help='Number of tasks per stage')
+    parser.add_argument('--ntasks', type=int, help='Tasks per stage')
     parser.add_argument('--operators', nargs='+', help='op_exe:op_args pairs')
     parser.add_argument('--src', type=str, help='Source file')
     parser.add_argument('--dest', type=str, help='Destination file')
@@ -1038,7 +1108,6 @@ def main():
     
     args = parser.parse_args()
     
-    # Submit mode - just send job to leader and exit
     if args.submit:
         if not args.nstages or not args.operators:
             print("Error: --submit requires --nstages and --operators")
@@ -1046,16 +1115,13 @@ def main():
         submit_job(args)
         return
     
-    # Node mode - requires vm-id
     if args.vm_id is None:
         print("Error: --vm-id required for leader/worker mode")
         sys.exit(1)
     
-    # Start HyDFS node
     hydfs_node = HyDFSNode(args.vm_id)
     hydfs_node.start()
     
-    # Join membership
     hydfs_node.membership.join_group()
     time.sleep(2)
     
@@ -1064,7 +1130,7 @@ def main():
         leader.start()
         
         print("Leader running. Waiting for job submissions...")
-        print("Submit jobs from another terminal using:")
+        print("Submit jobs using:")
         print("  python3 rainstorm.py --submit --nstages N --ntasks M --operators ... --src FILE --dest FILE")
         print("Press Ctrl+C to stop.")
         

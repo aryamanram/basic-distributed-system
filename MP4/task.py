@@ -14,6 +14,12 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional, Set
 
+# Add parent directory to path for MP3 imports
+_parent_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
+sys.path.insert(0, _parent_dir)
+_mp3_dir = os.path.join(_parent_dir, 'MP3')
+sys.path.insert(0, _mp3_dir)
+
 RAINSTORM_PORT = 8000
 TASK_BASE_PORT = 8100
 
@@ -47,16 +53,17 @@ class ExactlyOnceTracker:
     Uses local file for persistence (can be synced to HyDFS separately).
     """
     
-    def __init__(self, task_id: str, hydfs_client, logger: TaskLogger):
+    def __init__(self, task_id: str, run_id: str, logger: TaskLogger):
         self.task_id = task_id
-        self.hydfs_client = hydfs_client  # May be None
+        self.run_id = run_id
         self.logger = logger
         
         self.processed_ids: Set[str] = set()
         self.acked_outputs: Set[str] = set()
         self.lock = threading.Lock()
         
-        self.local_log_file = f"eo_log_{task_id}.log"
+        # Include run_id in log file name to separate between jobs
+        self.local_log_file = f"eo_log_{task_id}_{run_id}.log"
         
         # Batch for efficiency
         self.pending_log_entries: List[str] = []
@@ -181,6 +188,11 @@ class RainStormTask:
         # EOF tracking
         self.eof_received = 0
         self.expected_eof = 0
+        
+        # Output buffering for HyDFS writes
+        self.output_buffer: List[str] = []
+        self.output_buffer_lock = threading.Lock()
+        self.output_batch_size = 50  # Flush to HyDFS every N tuples
     
     def start(self):
         """Start the task."""
@@ -189,9 +201,9 @@ class RainStormTask:
         self.logger.log(f"TASK START: stage={self.stage} idx={self.task_idx} "
                        f"op={self.op_exe} args={self.op_args}")
         
-        # Initialize exactly-once tracker (file-based, no HyDFS dependency)
+        # Initialize exactly-once tracker (file-based)
         if self.exactly_once:
-            self.eo_tracker = ExactlyOnceTracker(self.task_id, None, self.logger)
+            self.eo_tracker = ExactlyOnceTracker(self.task_id, self.run_id, self.logger)
         
         # Get configuration from leader
         self._get_config_from_leader()
@@ -219,6 +231,10 @@ class RainStormTask:
         """Stop the task."""
         self.running = False
         
+        # Flush any remaining output to HyDFS
+        if self.stage == self.num_stages - 1:
+            self._flush_output_to_hydfs()
+        
         if self.eo_tracker:
             self.eo_tracker.flush()
         
@@ -245,7 +261,7 @@ class RainStormTask:
                 self.num_stages = response.get('num_stages', 1)
                 
                 self.logger.log(f"CONFIG: successors={len(self.successor_tasks)} "
-                              f"dest={self.hydfs_dest}")
+                              f"dest={self.hydfs_dest} num_stages={self.num_stages}")
         except Exception as e:
             self.logger.log(f"CONFIG ERROR: {e}")
     
@@ -261,7 +277,11 @@ class RainStormTask:
     
     def _notify_leader_completed(self):
         """Notify leader that task has completed."""
-        msg = {'type': 'TASK_COMPLETED', 'task_id': self.task_id}
+        msg = {
+            'type': 'TASK_COMPLETED', 
+            'task_id': self.task_id,
+            'tuples_processed': self.tuples_processed
+        }
         self._send_to_leader(msg)
     
     def _send_to_leader(self, msg: dict) -> Optional[dict]:
@@ -342,14 +362,10 @@ class RainStormTask:
         
         self.tuples_processed += 1
         
-        # Log output
-        for out_key, out_value in output_tuples:
-            self.logger.log(f"OUTPUT: key={out_key} value={out_value}")
-        
         # Forward to next stage or output
         if self.stage == self.num_stages - 1:
-            # Last stage - write to HyDFS
-            self._write_output(output_tuples)
+            # Last stage - buffer output for HyDFS
+            self._buffer_output(output_tuples)
         else:
             # Forward to next stage
             for out_key, out_value in output_tuples:
@@ -494,20 +510,57 @@ class RainStormTask:
         self.logger.log(f"EOF processed, stopping task (processed {self.tuples_processed} tuples)")
         self.stop()
     
-    def _write_output(self, tuples: List[tuple]):
-        """Write output tuples to local file (can be collected to HyDFS later)."""
+    def _buffer_output(self, tuples: List[tuple]):
+        """Buffer output tuples and flush to HyDFS when batch is full."""
         if not tuples:
             return
         
-        # Write to local output file
-        output_file = f"output_{self.task_id}.txt"
-        with open(output_file, 'a') as f:
+        with self.output_buffer_lock:
             for key, value in tuples:
-                f.write(f"{key}\t{value}\n")
-        
-        # Also print to console
-        for key, value in tuples:
-            print(f"OUTPUT: {key}\t{value}")
+                output_line = f"{key}\t{value}"
+                self.output_buffer.append(output_line)
+                
+                # Print to console continuously as required by spec
+                print(f"OUTPUT: {output_line}")
+            
+            # Flush to HyDFS if buffer is full
+            if len(self.output_buffer) >= self.output_batch_size:
+                self._flush_output_to_hydfs()
+    
+    def _flush_output_to_hydfs(self):
+        """Flush buffered output to HyDFS destination file via leader."""
+        with self.output_buffer_lock:
+            if not self.output_buffer:
+                return
+            
+            if not self.hydfs_dest:
+                self.logger.log("WARNING: No HyDFS destination configured, skipping flush")
+                self.output_buffer.clear()
+                return
+            
+            try:
+                # Send output data to leader for HyDFS append
+                output_data = "\n".join(self.output_buffer) + "\n"
+                
+                msg = {
+                    'type': 'APPEND_OUTPUT',
+                    'hydfs_dest': self.hydfs_dest,
+                    'data': list(output_data.encode('utf-8')),
+                    'task_id': self.task_id,
+                    'run_id': self.run_id
+                }
+                
+                response = self._send_to_leader(msg)
+                
+                if response and response.get('status') == 'success':
+                    self.logger.log(f"HYDFS FLUSH: Appended {len(self.output_buffer)} lines to {self.hydfs_dest}")
+                else:
+                    self.logger.log(f"HYDFS FLUSH ERROR: {response.get('message') if response else 'No response'}")
+                
+                self.output_buffer.clear()
+                
+            except Exception as e:
+                self.logger.log(f"HYDFS FLUSH ERROR: {e}")
     
     def _rate_report_loop(self):
         """Report rate to leader every second."""
