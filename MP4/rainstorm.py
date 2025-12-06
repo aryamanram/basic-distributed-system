@@ -146,6 +146,7 @@ class RainStormLeader:
         
         # Job state
         self.running = False
+        self.job_running = False  # True while a job is actively processing
         self.job_config: Optional[dict] = None
         self.tasks: Dict[str, TaskInfo] = {}  # task_id -> TaskInfo
         self.tasks_lock = threading.Lock()
@@ -305,6 +306,17 @@ class RainStormLeader:
         """Handle task completion notification."""
         task_id = msg.get('task_id')
         self.logger.log(f"TASK END: {task_id}")
+
+        # Remove completed task from tracking
+        with self.tasks_lock:
+            if task_id in self.tasks:
+                del self.tasks[task_id]
+
+            # Check if all tasks are done
+            if len(self.tasks) == 0 and self.job_running:
+                self.job_running = False
+                self.logger.log("JOB COMPLETE: All tasks finished")
+
         return {'status': 'success'}
     
     def _handle_list_tasks(self) -> dict:
@@ -401,11 +413,12 @@ class RainStormLeader:
             self.logger.log(f"LEADER ERROR sending to {hostname}: {e}")
             return None
     
-    def start_job(self, nstages: int, ntasks_per_stage: int, 
-                  operators: List[Tuple[str, str]], hydfs_src: str, 
+    def start_job(self, nstages: int, ntasks_per_stage: int,
+                  operators: List[Tuple[str, str]], hydfs_src: str,
                   hydfs_dest: str, exactly_once: bool, autoscale_enabled: bool,
                   input_rate: int = 100, lw: int = 50, hw: int = 150):
         """Start a RainStorm job."""
+        self.job_running = True
         self.logger.log(f"RUN START: stages={nstages} tasks_per_stage={ntasks_per_stage}")
         self.logger.log(f"  src={hydfs_src} dest={hydfs_dest}")
         self.logger.log(f"  exactly_once={exactly_once} autoscale={autoscale_enabled}")
@@ -830,15 +843,19 @@ class RainStormLeader:
                 self.stage_tasks[stage_idx].remove(task_id)
     
     def _rate_log_loop(self):
-        """Log rates every second."""
+        """Log rates every second while job is running."""
         while self.running:
             try:
                 time.sleep(1.0)
-                
+
+                # Only log rates while job is actively running
+                if not self.job_running:
+                    continue
+
                 with self.rates_lock:
                     for task_id, rate in self.task_rates.items():
                         self.logger.log(f"RATE: {task_id} {rate:.2f} tuples/sec")
-                        
+
             except Exception as e:
                 pass
 
